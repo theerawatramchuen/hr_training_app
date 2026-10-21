@@ -4,7 +4,7 @@ A desktop training application for the **TRACKR HEART RATE** chest strap. An adv
 
 The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live heart rate chart coloured by training zone, and records each session with Start, Pause, Resume and Stop controls.
 
-<img width="1400" height="900" alt="image" src="https://github.com/user-attachments/assets/2711cabe-baaf-4e4a-888f-e7feb069fccc" />
+![TRACKR HEART RATE training app](trackr_app_screenshot.png)
 
 ---
 
@@ -37,7 +37,8 @@ The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live
 | **Live dashboard** | Heart rate, zone, % of max HR, elapsed and remaining time, average and peak HR, HRV (RMSSD), signal quality, training load (TRIMP), calories and time in zone |
 | **Alerts** | Optional high heart rate alarm and a notification when the target training time is reached |
 | **Auto-reconnect** | The Bluetooth link reconnects automatically if it drops |
-| **Session export** | Every session is saved as a CSV of all samples and a PNG of the chart |
+| **Saved config** | **Save Config** stores your name, athlete details, sensor and session settings; they load automatically the next time you open the app |
+| **Session report** | Every session is saved as a CSV of all samples and a PNG report with name, age, sex, weight, date and time, session summary, the HR chart and time-in-zone percentages |
 
 ---
 
@@ -110,18 +111,21 @@ python trackr_hr.py --source ant
 ```
 
 1. Moisten the strap's electrodes and put it on. The strap wakes up when it detects your heartbeat.
-2. Pick the **Connection** type and enter your athlete details.
+2. Pick the **Connection** type and enter your name and athlete details.
 3. Set the **Training time**; the default is 50 minutes.
-4. Press **Start**.
+4. Press **Save Config** so your settings are there next time (you only need to do this once, or when something changes).
+5. Press **Start**.
 
 ---
 
 ## Command-line options
 
-All options are optional. They only preset the fields in the app, and you can change them in the window before pressing Start.
+All options are optional. They preset the fields in the app **for that run only**, overriding the saved config. They are not written to the config unless you press **Save Config**. Defaults apply when neither the saved config nor an option sets a value.
 
 | Option | Default | Description |
 |---|---|---|
+| `--config PATH` | `~/.trackr_hr/config.json` | Config file to load and save; use one file per athlete if several people share the computer |
+| `--name NAME` | empty | Athlete name |
 | `--source {ble,ant,sim}` | `ble` | Connection type selected at startup |
 | `--address ADDR` | auto | Bluetooth address (Windows/Linux) or UUID (macOS) of the strap |
 | `--ant-id N` | `0` | ANT+ device ID; `0` connects to the first strap found |
@@ -133,10 +137,12 @@ All options are optional. They only preset the fields in the app, and you can ch
 | `--sex {m,f}` | `m` | Used for training load and calories |
 | `--alert-hr N` | off | Beep when heart rate goes above this value |
 
-Example:
+Examples:
 
 ```bash
 python trackr_hr.py --source ble --minutes 60 --age 35 --rest-hr 55 --max-hr 186 --weight 68 --alert-hr 175
+python trackr_hr.py --minutes 30                      # saved settings, but a 30-minute session today
+python trackr_hr.py --config ~/athletes/nok.json      # a second athlete with their own config
 ```
 
 ---
@@ -148,7 +154,7 @@ python trackr_hr.py --source ble --minutes 60 --age 35 --rest-hr 55 --max-hr 186
 | Area | Contents |
 |---|---|
 | **Header** | Connection status (for example `● Connected (BLE)`) and session state badge: `READY`, `● RECORDING` or `❚❚ PAUSED` |
-| **Left panel** | Sensor, athlete and session settings, plus the Start / Pause / Resume / Stop buttons |
+| **Left panel** | Sensor, athlete and session settings, the Start / Pause / Resume / Stop buttons and **Save Config** |
 | **Heart rate card** | Large live heart rate in the current zone colour, with zone name and % of max HR |
 | **Metric cards** | Elapsed, Remaining, Avg HR, Peak HR, HRV (RMSSD), Signal, Training load, Calories |
 | **Chart** | Real-time heart rate against training time |
@@ -167,9 +173,43 @@ The connection starts when you press **Start** and ends when you press **Stop**.
 
 ### 2. Enter athlete settings
 
-Age, resting HR, max HR, weight and sex determine your heart rate zones, training load and calories. The zone bands on the chart update as you type. Leave **Max HR** blank to estimate it from your age.
+**Name** is printed on the session report and added to the session file names. Age, resting HR, max HR, weight and sex determine your heart rate zones, training load and calories. The zone bands on the chart update as you type. Leave **Max HR** blank to estimate it from your age.
 
 Settings are locked during a session so the numbers stay consistent. Only **Training time** and **HR alert** can be changed while recording.
+
+### Saving your settings (Save Config)
+
+Press **Save Config** to store the current settings. The button briefly shows **✓ Saved**, and the status bar shows where the file was written. The next time you open the app, the saved settings are loaded automatically and the status bar shows `Loaded saved config from …`.
+
+| Saved | Not saved |
+|---|---|
+| Name, age, resting HR, max HR, weight, sex | Session data (that goes into the session files) |
+| Connection type, chosen Bluetooth strap, ANT+ ID | |
+| Training time, HR alert | |
+
+- Settings are checked before saving; if a value is out of range, an error explains which one.
+- Changes are **not** saved automatically. If you change a setting and close the app without pressing Save Config, the previous saved settings load next time.
+- The config is stored in `~/.trackr_hr/config.json` (on Windows `C:\Users\<you>\.trackr_hr\config.json`). It is plain JSON, so you can also edit or back it up. If the file is damaged, the app starts with default settings and says so in the status bar; pressing Save Config writes a fresh file.
+- A remembered Bluetooth strap is reconnected directly at Start, without scanning.
+
+Example `config.json`:
+
+```json
+{
+  "name": "Somchai Jaidee",
+  "source": "ble",
+  "device": "TRACKR HR (C4:7F:51:2A:90:1B)",
+  "device_address": "C4:7F:51:2A:90:1B",
+  "ant_id": 0,
+  "age": 42,
+  "rest_hr": 52,
+  "max_hr": null,
+  "weight": 64.5,
+  "sex": "f",
+  "minutes": 50,
+  "alert_hr": 170
+}
+```
 
 ### 3. Session controls
 
@@ -284,11 +324,28 @@ When you press **Stop**, the session is saved in a `trackr_sessions` folder insi
 
 ```
 trackr_sessions/
-├── session_20261020_081737.csv    # every sample
-└── session_20261020_081737.png    # chart image
+├── session_20261021_094620_Somchai_Jaidee.csv    # every sample
+└── session_20261021_094620_Somchai_Jaidee.png    # session report image
 ```
 
-The file name is the session start time. A summary window shows the duration, average and peak HR, training load, calories, time in each zone, and where the files were saved. If no heart rate data was recorded, nothing is saved.
+The file name is the session start time followed by the athlete's name (spaces become `_`; names in any language, such as Thai, are kept). Without a name, the file is just `session_<date>_<time>`. A summary window shows the athlete, duration, average and peak HR, training load, calories, time in each zone, and where the files were saved. If no heart rate data was recorded, nothing is saved.
+
+### Session report (PNG)
+
+![Session report example](trackr_session_report_example.png)
+
+The report image is made for sharing with a coach or keeping as a training record. It contains:
+
+| Section | Contents |
+|---|---|
+| **Header** | TRACKR title, resting HR and max HR used for the zones |
+| **Athlete** | Name, age, sex, weight |
+| **Date / time** | Session date with start and end time (both dates shown if the session crosses midnight) |
+| **Summary** | Active duration, average HR, peak HR, training load (TRIMP), calories |
+| **Heart rate chart** | Full session, coloured by zone, with zone bands, target-time line, pause markers and the peak marked |
+| **Time in zone** | Coloured bar with the percentage of each zone, plus the per-zone percentage, time and bpm range |
+
+The report is drawn separately from the window, so it always has the same size and layout (about 1690 × 1120 pixels) whatever the window size. If the image cannot be created, the CSV is still saved and a warning is shown.
 
 ### CSV columns
 
@@ -335,7 +392,8 @@ Everything is in a single file, `trackr_hr.py`.
                     ├── HeartRateDetector   → filtered HR, confidence, HRV
                     ├── TrainingAnalytics   → zones, TRIMP, calories, time in zone
                     ├── matplotlib chart    → redrawn once per second
-                    └── session recorder    → CSV + PNG on Stop
+                    ├── config              → ~/.trackr_hr/config.json (Save Config / startup)
+                    └── session recorder    → CSV + report PNG on Stop
 ```
 
 | Component | Role |
@@ -347,7 +405,9 @@ Everything is in a single file, `trackr_hr.py`.
 | `SensorWorker` | Runs the selected source in a background thread so the window never freezes |
 | `HeartRateDetector` | The five-stage detection algorithm |
 | `TrainingAnalytics` | Zones, TRIMP, calories, averages and time in zone |
-| `TrackrApp` | The Tkinter window, session state machine (ready → recording ⇄ paused → ready), chart and file saving |
+| `load_config()` / `write_config()` | Read the saved config at startup and write it (atomically) on Save Config |
+| `TrackrApp` | The Tkinter window, session state machine (ready → recording ⇄ paused → ready), chart, config and file saving |
+| `TrackrApp._render_report()` | Draws the session report PNG |
 
 **Bluetooth identifiers used:** Heart Rate Service `0x180D`, Heart Rate Measurement `0x2A37`, Battery Level `0x2A19`.
 
@@ -369,6 +429,10 @@ Everything is in a single file, `trackr_hr.py`.
 | **"No signal" during a session** | The strap went out of range or lost contact. Bluetooth reconnects automatically; the session keeps running |
 | **"Sensor stopped" message** | The connection ended with an error. Press **Stop** to save, then **Start** to reconnect |
 | **No module named tkinter** | Linux: `sudo apt install python3-tk`. macOS with Homebrew: `brew install python-tk` |
+| **Settings are not remembered** | Press **Save Config** after changing settings; changes are not saved automatically. Check the status bar at startup: it says whether the config was loaded |
+| **"Saved config could not be read"** | The config file is damaged. Fix it in a text editor, or just press Save Config to write a new one |
+| **Settings differ from what I saved** | A command-line option (for example `--minutes`) overrides the saved value for that run |
+| **Name shows as boxes in the report** | The computer has no font for that script. Windows and macOS include Thai fonts; on Linux install one, for example `sudo apt install fonts-thai-tlwg` |
 | **Text looks blurry on Windows** | The app turns on high-DPI support automatically; if it still looks blurry, check Windows display scaling settings |
 
 ---
