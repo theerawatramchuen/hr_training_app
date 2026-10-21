@@ -13,7 +13,9 @@ Desktop training application for the TRACKR HEART RATE chest strap.
 * Start / Pause / Resume / Stop session controls
 * Live HR, zone, elapsed / remaining time, HRV (RMSSD), signal quality,
   average / peak HR, training load (TRIMP), calories, time in zone
-* Every session is saved as CSV + chart PNG in ./trackr_sessions
+* Every session is saved as CSV + a session report PNG (athlete details,
+  date/time, summary, HR chart, time-in-zone %) in ./trackr_sessions
+* Save Config button: settings are stored and loaded automatically at startup
 
 Install
 -------
@@ -26,6 +28,9 @@ Run
     python trackr_hr.py                         # open the app
     python trackr_hr.py --source sim            # start with the simulator selected
     python trackr_hr.py --minutes 60 --age 35 --rest-hr 55
+    python trackr_hr.py --config coach_athlete2.json   # use another config file
+
+Command-line options override the saved config for that run only.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import math
 import os
 import queue
@@ -54,7 +60,9 @@ import numpy as np
 import matplotlib
 
 matplotlib.use("TkAgg")
+from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
+from matplotlib import font_manager  # noqa: E402
 from matplotlib.collections import LineCollection  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
@@ -523,6 +531,87 @@ SOURCES = {"Bluetooth LE": "ble", "ANT+": "ant", "Simulator": "sim"}
 FONT = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
 DEFAULT_MINUTES = 50
 
+# Fonts for the chart / report image, with fallbacks so non-Latin names
+# (e.g. Thai) render correctly. Only fonts installed on this computer are used.
+_FONT_CANDIDATES = ["DejaVu Sans", "Segoe UI", "Tahoma", "Leelawadee UI", "Thonburi",
+                    "Noto Sans Thai", "Noto Sans", "Garuda", "Loma", "Arial Unicode MS"]
+_installed = {f.name for f in font_manager.fontManager.ttflist}
+matplotlib.rcParams["font.family"] = [f for f in _FONT_CANDIDATES if f in _installed] or ["sans-serif"]
+
+# --------------------------------------------------------------------------
+# Config file (saved with the Save Config button, loaded at startup)
+# --------------------------------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".trackr_hr", "config.json")
+DEFAULT_CONFIG = {
+    "name": "", "source": "ble", "device": "", "device_address": "", "ant_id": 0,
+    "age": 30, "rest_hr": 60, "max_hr": None, "weight": 70.0, "sex": "m",
+    "minutes": DEFAULT_MINUTES, "alert_hr": None,
+}
+
+
+def load_config(path: str) -> tuple[dict, str]:
+    """Return (config, status message). Missing or unreadable files give defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if not os.path.exists(path):
+        return cfg, "No saved config yet. Enter your settings and press Save Config."
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except Exception as exc:
+        return cfg, f"Saved config could not be read ({exc}); using defaults."
+    cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
+    if cfg["source"] not in SOURCES.values():
+        cfg["source"] = "ble"
+    if cfg["sex"] not in ("m", "f"):
+        cfg["sex"] = "m"
+    return cfg, f"Loaded saved config from {path}"
+
+
+def write_config(path: str, cfg: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)                      # atomic: never leaves a half-written file
+
+
+def safe_filename(text: str) -> str:
+    """Make text safe for a file name while keeping non-Latin letters."""
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", text).strip("._")[:40]
+
+
+def style_hr_axes(ax, a: "TrainingAnalytics", zone_fontsize: float = 8) -> None:
+    """Shared look for the live chart and the session report chart."""
+    ax.set_facecolor(PANEL)
+    for (name, lo, hi), z in zip(a.zone_bounds(), range(1, 6)):
+        ax.axhspan(lo, hi, color=ZONE_HEX[z], alpha=0.10, lw=0)
+        ax.text(1.01, (lo + hi) / 2, f"{name}\n{lo}–{hi}", transform=ax.get_yaxis_transform(),
+                color=ZONE_HEX[z], va="center", fontsize=zone_fontsize, fontweight="bold",
+                linespacing=1.1)
+    ax.grid(True, color="#2a343f", lw=0.6)
+    for sp in ax.spines.values():
+        sp.set_color("#2a343f")
+    ax.tick_params(colors=MUTED, labelsize=9)
+    ax.set_xlabel("Training time (min)", color=MUTED, fontsize=9)
+    ax.set_ylabel("Heart rate (bpm)", color=MUTED, fontsize=9)
+
+
+def hr_segments(xs: List[float], ys: List[float], zs: List[int]):
+    """Line segments coloured by the zone of their end point."""
+    if len(xs) < 2:
+        return [], []
+    pts = np.column_stack([xs, ys])
+    return np.stack([pts[:-1], pts[1:]], axis=1), [ZONE_HEX[z] for z in zs[1:]]
+
+
+def hr_limits(a: "TrainingAnalytics", xs: List[float], ys: List[float], minutes: float):
+    xmax = max(minutes, (xs[-1] if xs else 0))
+    ymin = min([max(40, a.rest_hr - 10)] + [y - 5 for y in ys])
+    ymax = max([a.max_hr + 10] + [y + 5 for y in ys])
+    return xmax, ymin, ymax
+
 
 def fmt_time(sec: float) -> str:
     sec = max(0, int(sec))
@@ -534,9 +623,18 @@ def fmt_time(sec: float) -> str:
 class TrackrApp(tk.Tk):
     def __init__(self, args: argparse.Namespace):
         super().__init__()
+        self.config_path = args.config or CONFIG_PATH
+        cfg, cfg_msg = load_config(self.config_path)
+        # command-line options override the saved config for this run
+        for key in ("name", "source", "ant_id", "age", "rest_hr", "max_hr", "weight", "sex",
+                    "minutes", "alert_hr"):
+            if getattr(args, key, None) is not None:
+                cfg[key] = getattr(args, key)
+        if args.address:
+            cfg["device"] = cfg["device_address"] = args.address
         self.title("TRACKR HEART RATE - Training")
         self.geometry("1320x840")
-        self.minsize(1080, 700)
+        self.minsize(1080, 760)
         self.configure(bg=BG)
 
         self.q: queue.Queue = queue.Queue()
@@ -545,12 +643,15 @@ class TrackrApp(tk.Tk):
         self.accum = 0.0                    # active seconds before the current run segment
         self.run_started = 0.0
         self.session_start: Optional[datetime] = None
+        self.session_end: Optional[datetime] = None
         self.last_sample_mono = 0.0
         self.connected = False
         self.target_notified = False
         self.last_alert = 0.0
         self.chart_dirty = True
         self.scan_map: dict[str, str] = {}
+        if cfg["device"] and cfg["device_address"] and cfg["device"] != cfg["device_address"]:
+            self.scan_map[cfg["device"]] = cfg["device_address"]   # remembered strap
 
         self.detector = HeartRateDetector()
         self.analytics = TrainingAnalytics(30, 60, None, 70, True)
@@ -561,16 +662,22 @@ class TrackrApp(tk.Tk):
         self.pause_marks: List[float] = []
 
         # ---- settings variables ----
-        self.v_source = tk.StringVar(value={v: k for k, v in SOURCES.items()}[args.source])
-        self.v_device = tk.StringVar(value=args.address or "")
-        self.v_ant = tk.StringVar(value=str(args.ant_id))
-        self.v_age = tk.StringVar(value=str(args.age))
-        self.v_rest = tk.StringVar(value=str(args.rest_hr))
-        self.v_max = tk.StringVar(value=str(args.max_hr) if args.max_hr else "")
-        self.v_weight = tk.StringVar(value=str(args.weight))
-        self.v_sex = tk.StringVar(value="Male" if args.sex == "m" else "Female")
-        self.v_minutes = tk.StringVar(value=str(args.minutes))
-        self.v_alert = tk.StringVar(value=str(args.alert_hr) if args.alert_hr else "")
+        def txt(v) -> str:
+            if v is None:
+                return ""
+            return f"{v:g}" if isinstance(v, float) else str(v)
+
+        self.v_name = tk.StringVar(value=txt(cfg["name"]))
+        self.v_source = tk.StringVar(value={v: k for k, v in SOURCES.items()}[cfg["source"]])
+        self.v_device = tk.StringVar(value=txt(cfg["device"]))
+        self.v_ant = tk.StringVar(value=txt(cfg["ant_id"]))
+        self.v_age = tk.StringVar(value=txt(cfg["age"]))
+        self.v_rest = tk.StringVar(value=txt(cfg["rest_hr"]))
+        self.v_max = tk.StringVar(value=txt(cfg["max_hr"]))
+        self.v_weight = tk.StringVar(value=txt(cfg["weight"]))
+        self.v_sex = tk.StringVar(value="Male" if cfg["sex"] == "m" else "Female")
+        self.v_minutes = tk.StringVar(value=txt(cfg["minutes"]))
+        self.v_alert = tk.StringVar(value=txt(cfg["alert_hr"]))
 
         self._style()
         self._build()
@@ -583,6 +690,9 @@ class TrackrApp(tk.Tk):
         self.v_minutes.trace_add("write", lambda *_: self._on_minutes_changed())
         self.v_source.trace_add("write", lambda *_: self._on_source_changed())
         self._on_source_changed()
+        if self.scan_map:
+            self.dev_cb.config(values=list(self.scan_map))
+        self._status(cfg_msg)
 
         self.bind("<space>", self._space_toggle)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -610,10 +720,11 @@ class TrackrApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.foreground", FG)
 
         for name, color in (("Start", "#16a34a"), ("Pause", "#d97706"),
-                            ("Resume", "#2563eb"), ("Stop", "#dc2626"), ("Small", "#334155")):
+                            ("Resume", "#2563eb"), ("Stop", "#dc2626"), ("Small", "#334155"),
+                            ("Config", "#334155")):
+            size, pad = {"Small": (9, (6, 3)), "Config": (10, (8, 7))}.get(name, (12, (10, 10)))
             st.configure(f"{name}.TButton", background=color, foreground="white",
-                         font=(FONT, 12 if name != "Small" else 9, "bold"),
-                         padding=(10, 10) if name != "Small" else (6, 3), borderwidth=0)
+                         font=(FONT, size, "bold"), padding=pad, borderwidth=0)
             st.map(f"{name}.TButton",
                    background=[("disabled", "#2a333d"), ("active", color)],
                    foreground=[("disabled", "#5b6773")])
@@ -677,13 +788,14 @@ class TrackrApp(tk.Tk):
         self.lockable.append(self._row(f, 2, "ANT+ ID (0=any)", self.ant_entry))
 
         f = self._section(left, "Athlete")
+        self.lockable.append(self._row(f, 0, "Name", ttk.Entry(f, textvariable=self.v_name, width=16)))
         for r, (lbl, var, lo, hi) in enumerate((("Age", self.v_age, 10, 100),
-                                                 ("Resting HR", self.v_rest, 30, 120))):
+                                                 ("Resting HR", self.v_rest, 30, 120)), start=1):
             sp = ttk.Spinbox(f, from_=lo, to=hi, textvariable=var, width=8)
             self.lockable.append(self._row(f, r, lbl, sp))
-        self.lockable.append(self._row(f, 2, "Max HR (blank=auto)", ttk.Entry(f, textvariable=self.v_max, width=8)))
-        self.lockable.append(self._row(f, 3, "Weight (kg)", ttk.Entry(f, textvariable=self.v_weight, width=8)))
-        self.lockable.append(self._row(f, 4, "Sex", ttk.Combobox(f, textvariable=self.v_sex,
+        self.lockable.append(self._row(f, 3, "Max HR (blank=auto)", ttk.Entry(f, textvariable=self.v_max, width=8)))
+        self.lockable.append(self._row(f, 4, "Weight (kg)", ttk.Entry(f, textvariable=self.v_weight, width=8)))
+        self.lockable.append(self._row(f, 5, "Sex", ttk.Combobox(f, textvariable=self.v_sex,
                                                                  values=["Male", "Female"],
                                                                  state="readonly", width=8)))
 
@@ -704,6 +816,12 @@ class TrackrApp(tk.Tk):
         self.btn_resume.grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=4)
         self.btn_stop.grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=4)
         tk.Label(left, text="Space = pause / resume", bg=PANEL, fg=MUTED,
+                 font=(FONT, 8)).pack(anchor="w", padx=14)
+
+        self.btn_config = ttk.Button(left, text="Save Config", style="Config.TButton",
+                                     command=self.save_config)
+        self.btn_config.pack(fill="x", padx=14, pady=(14, 2))
+        tk.Label(left, text="Saved settings load automatically at startup", bg=PANEL, fg=MUTED,
                  font=(FONT, 8)).pack(anchor="w", padx=14)
 
         # ---------------- right panel: metrics + chart
@@ -822,18 +940,8 @@ class TrackrApp(tk.Tk):
     def _setup_chart(self) -> None:
         ax, a = self.ax, self.analytics
         ax.clear()
-        ax.set_facecolor(PANEL)
         self.fig.subplots_adjust(left=0.06, right=0.88, top=0.93, bottom=0.12)
-        for (name, lo, hi), z in zip(a.zone_bounds(), range(1, 6)):
-            ax.axhspan(lo, hi, color=ZONE_HEX[z], alpha=0.10, lw=0)
-            ax.text(1.01, (lo + hi) / 2, f"{name}\n{lo}–{hi}", transform=ax.get_yaxis_transform(),
-                    color=ZONE_HEX[z], va="center", fontsize=8, fontweight="bold", linespacing=1.1)
-        ax.grid(True, color="#2a343f", lw=0.6)
-        for s in ax.spines.values():
-            s.set_color("#2a343f")
-        ax.tick_params(colors=MUTED, labelsize=9)
-        ax.set_xlabel("Training time (min)", color=MUTED, fontsize=9)
-        ax.set_ylabel("Heart rate (bpm)", color=MUTED, fontsize=9)
+        style_hr_axes(ax, a)
         self.chart_title = ax.set_title("", color=FG, fontsize=10, loc="left")
         self.lc = LineCollection([], linewidths=2.4, capstyle="round")
         ax.add_collection(self.lc)
@@ -850,17 +958,13 @@ class TrackrApp(tk.Tk):
                 self.chart_dirty = False
                 a, minutes = self.analytics, self._minutes()
                 xs, ys = self.t_min, self.hr_pts
-                if len(xs) >= 2:
-                    pts = np.column_stack([xs, ys])
-                    self.lc.set_segments(np.stack([pts[:-1], pts[1:]], axis=1))
-                    self.lc.set_colors([ZONE_HEX[z] for z in self.z_pts[1:]])
-                else:
-                    self.lc.set_segments([])
+                segs, colors = hr_segments(xs, ys, self.z_pts)
+                self.lc.set_segments(segs)
+                if colors:
+                    self.lc.set_colors(colors)
                 self.dot.set_data(xs[-1:], ys[-1:])
-                xmax = max(minutes, (xs[-1] if xs else 0))
+                xmax, ymin, ymax = hr_limits(a, xs, ys, minutes)
                 self.ax.set_xlim(0, xmax)
-                ymin = min([max(40, a.rest_hr - 10)] + [y - 5 for y in ys[-3000:]])
-                ymax = max([a.max_hr + 10] + [y + 5 for y in ys[-3000:]])
                 self.ax.set_ylim(ymin, ymax)
                 self.target_line.set_xdata([minutes, minutes])
                 self.chart_title.set_text(f"Real-time heart rate · display period {minutes:g} min")
@@ -963,6 +1067,7 @@ class TrackrApp(tk.Tk):
             return
         if self.state == "running":
             self.accum += time.monotonic() - self.run_started
+        self.session_end = datetime.now()
         self.state = "idle"
         self._disconnect()
         self._lock_settings(False)
@@ -1118,25 +1223,175 @@ class TrackrApp(tk.Tk):
             return
         os.makedirs("trackr_sessions", exist_ok=True)
         stamp = (self.session_start or datetime.now()).strftime("%Y%m%d_%H%M%S")
-        base = os.path.join("trackr_sessions", f"session_{stamp}")
+        who = safe_filename(self.v_name.get().strip())
+        base = os.path.join("trackr_sessions", f"session_{stamp}" + (f"_{who}" if who else ""))
         with open(base + ".csv", "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["time", "elapsed_s", "hr_filtered", "hr_device", "confidence", "rmssd_ms",
                         "zone", "trimp", "kcal", "rr_accepted_ms", "rr_rejected", "contact"])
             w.writerows(self.rows)
-        self.fig.savefig(base + ".png", facecolor=self.fig.get_facecolor(), dpi=130)
+        try:
+            self._render_report(base + ".png")
+        except Exception as exc:               # never lose the CSV because of the image
+            messagebox.showwarning("Session report", f"The CSV was saved, but the report image "
+                                   f"could not be created:\n{exc}")
 
         total = sum(a.zone_time.values()) or 1
         zones = "\n".join(f"   {name:<13} {lo}-{hi} bpm   {fmt_time(a.zone_time[z])}  "
                           f"({100 * a.zone_time[z] / total:.0f}%)"
                           for (name, lo, hi), z in zip(a.zone_bounds(), range(1, 6)))
-        summary = (f"Duration:   {fmt_time(el)}  (target {self._minutes():g} min)\n"
+        name = self.v_name.get().strip()
+        summary = ((f"Athlete:   {name}\n" if name else "") +
+                   f"Duration:   {fmt_time(el)}  (target {self._minutes():g} min)\n"
                    f"Avg / Peak HR:   {a.avg_hr:.0f} / {a.peak_hr:.0f} bpm\n"
                    f"Training load (TRIMP):   {a.trimp:.1f}\n"
                    f"Calories:   {a.kcal:.0f} kcal\n\nTime in zone:\n{zones}\n\n"
                    f"Saved:\n   {os.path.abspath(base)}.csv\n   {os.path.abspath(base)}.png")
         self._status(f"Session saved to {os.path.abspath(base)}.csv")
         messagebox.showinfo("Training summary", summary)
+
+    def _render_report(self, path: str) -> None:
+        """Session report image: athlete, date/time, summary, HR chart and time in zone %."""
+        a, minutes = self.analytics, self._minutes()
+        start = self.session_start or datetime.now()
+        end = self.session_end or datetime.now()
+        name = self.v_name.get().strip() or "—"
+        if len(name) > 26:
+            name = name[:25] + "…"
+        sex = self.v_sex.get()
+        try:
+            weight = f"{float(self.v_weight.get()):g} kg"
+        except ValueError:
+            weight = "—"
+        same_day = start.date() == end.date()
+        when = (f"{start:%d %b %Y}  ·  {start:%H:%M}–{end:%H:%M}" if same_day else
+                f"{start:%d %b %Y %H:%M} – {end:%d %b %H:%M}")
+
+        fig = Figure(figsize=(13, 8.6), dpi=130, facecolor=BG)
+        FigureCanvasAgg(fig)
+        gs = fig.add_gridspec(3, 1, height_ratios=[1.55, 4.3, 1.0], hspace=0.30,
+                              left=0.065, right=0.865, top=0.93, bottom=0.05)
+
+        # ---- title
+        fig.text(0.065, 0.965, "♥ TRACKR", color=ACCENT, fontsize=17, fontweight="bold", va="center")
+        fig.text(0.175, 0.965, "HEART RATE  ·  Training Session Report", color=FG, fontsize=14,
+                 va="center")
+        fig.text(0.865, 0.965, f"Resting HR {a.rest_hr}  ·  Max HR {a.max_hr} bpm", color=MUTED,
+                 fontsize=10, va="center", ha="right")
+
+        # ---- athlete + summary cards
+        hx = fig.add_subplot(gs[0])
+        hx.set_axis_off()
+        hx.set_xlim(0, 1)
+        hx.set_ylim(0, 1)
+        cols = [0.0, 0.31, 0.43, 0.555, 0.695]
+        widths = [0.30, 0.11, 0.115, 0.13, 0.305]
+        rows = [
+            [("NAME", name), ("AGE", self.v_age.get() or "—"), ("SEX", sex), ("WEIGHT", weight),
+             ("DATE / TIME", when)],
+            [("DURATION", fmt_time(self.accum)), ("AVG HR", f"{a.avg_hr:.0f} bpm"),
+             ("PEAK HR", f"{a.peak_hr:.0f} bpm"), ("LOAD (TRIMP)", f"{a.trimp:.1f}"),
+             ("CALORIES", f"{a.kcal:.0f} kcal")],
+        ]
+        from matplotlib.patches import FancyBboxPatch
+        for r, row in enumerate(rows):
+            y0 = 0.54 if r == 0 else 0.0
+            for (label, value), x, w in zip(row, cols, widths):
+                hx.add_patch(FancyBboxPatch((x, y0), w - 0.01, 0.44, boxstyle="round,pad=0,rounding_size=0.015",
+                                            fc=PANEL, ec="none", transform=hx.transAxes, clip_on=False))
+                hx.text(x + 0.012, y0 + 0.33, label, color=MUTED, fontsize=8, fontweight="bold",
+                        va="center", transform=hx.transAxes)
+                hx.text(x + 0.012, y0 + 0.14, value, color=FG, fontsize=13 if label != "DATE / TIME" else 12,
+                        fontweight="bold", va="center", transform=hx.transAxes)
+
+        # ---- heart rate chart
+        ax = fig.add_subplot(gs[1])
+        style_hr_axes(ax, a, zone_fontsize=8.5)
+        ax.set_title(f"Heart rate · training time {minutes:g} min", color=FG, fontsize=10, loc="left")
+        segs, colors = hr_segments(self.t_min, self.hr_pts, self.z_pts)
+        if len(segs):
+            ax.add_collection(LineCollection(segs, colors=colors, linewidths=2.0, capstyle="round"))
+        ax.axvline(minutes, color=FG, ls="--", lw=1, alpha=0.5)
+        for m in self.pause_marks:
+            ax.axvline(m, color=MUTED, ls=":", lw=1)
+        xmax, ymin, ymax = hr_limits(a, self.t_min, self.hr_pts, minutes)
+        ax.set_xlim(0, xmax)
+        ax.set_ylim(ymin, ymax)
+        if self.hr_pts:
+            i = int(np.argmax(self.hr_pts))
+            ax.plot([self.t_min[i]], [self.hr_pts[i]], "o", ms=6, color="white", mec=ACCENT, mew=1.5, zorder=5)
+            ax.annotate(f"Peak {self.hr_pts[i]:.0f}", (self.t_min[i], self.hr_pts[i]),
+                        xytext=(6, 6), textcoords="offset points", color=FG, fontsize=8)
+
+        # ---- time in zone %
+        zx = fig.add_subplot(gs[2])
+        zx.set_axis_off()
+        zx.set_xlim(0, 1)
+        zx.set_ylim(0, 1)
+        zx.text(0, 1.02, "TIME IN ZONE", color=MUTED, fontsize=9, fontweight="bold", va="bottom",
+                transform=zx.transAxes)
+        total = sum(a.zone_time.values())
+        x = 0.0
+        if total <= 0:
+            zx.barh(0.72, 1.0, height=0.32, left=0, color=PANEL2)
+        for z in range(1, 6):
+            t = a.zone_time[z]
+            if total > 0 and t > 0:
+                w = t / total
+                zx.barh(0.72, w, height=0.32, left=x, color=ZONE_HEX[z])
+                if w >= 0.06:
+                    zx.text(x + w / 2, 0.72, f"{100 * w:.0f}%", color=BG, fontsize=10,
+                            fontweight="bold", ha="center", va="center")
+                x += w
+        for (zname, lo, hi), z in zip(a.zone_bounds(), range(1, 6)):
+            t = a.zone_time[z]
+            pct = 100 * t / total if total else 0
+            cx = (z - 0.5) / 5
+            zx.text(cx, 0.30, f"{zname}  {pct:.0f}%", color=ZONE_HEX[z], fontsize=10,
+                    fontweight="bold", ha="center", va="center")
+            zx.text(cx, 0.06, f"{fmt_time(t)}  ·  {lo}–{hi} bpm", color=MUTED, fontsize=8.5,
+                    ha="center", va="center")
+
+        fig.savefig(path, facecolor=BG)
+
+    # ------------------------------------------------------------------ config
+    def save_config(self) -> None:
+        if self.state == "idle" and not self._apply_athlete(preview=False):
+            return
+        try:
+            ant_id = self._int(self.v_ant, 0, 0, 65535) or 0
+            alert = self._int(self.v_alert, None, 60, 250)
+            minutes = float(self.v_minutes.get())
+            if not 1 <= minutes <= 600:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Save Config", "Please check the settings:\n"
+                                 "ANT+ ID 0-65535, HR alert 60-250 bpm (or blank), "
+                                 "training time 1-600 min.")
+            return
+        dev = self.v_device.get().strip()
+        cfg = {
+            "name": self.v_name.get().strip(),
+            "source": SOURCES.get(self.v_source.get(), "ble"),
+            "device": dev,
+            "device_address": self.scan_map.get(dev, dev),
+            "ant_id": ant_id,
+            "age": self._int(self.v_age, 30, 10, 100),
+            "rest_hr": self._int(self.v_rest, 60, 30, 120),
+            "max_hr": self._int(self.v_max, None, 120, 230),
+            "weight": float(self.v_weight.get() or 70),
+            "sex": "m" if self.v_sex.get() == "Male" else "f",
+            "minutes": int(minutes) if minutes == int(minutes) else minutes,
+            "alert_hr": alert,
+        }
+        try:
+            write_config(self.config_path, cfg)
+        except OSError as exc:
+            messagebox.showerror("Save Config", f"Could not save the config:\n{exc}")
+            return
+        self._status(f"Config saved to {self.config_path}. It will load automatically next time.")
+        self.btn_config.config(text="✓  Saved")
+        self.after(1800, lambda: self.btn_config.config(text="Save Config"))
 
     def _on_close(self) -> None:
         if self.state != "idle":
@@ -1154,17 +1409,21 @@ class TrackrApp(tk.Tk):
 # Entry point
 # ==========================================================================
 def main() -> None:
-    ap = argparse.ArgumentParser(description="TRACKR HEART RATE training app (BLE + ANT+)")
-    ap.add_argument("--source", choices=["ble", "ant", "sim"], default="ble")
+    ap = argparse.ArgumentParser(
+        description="TRACKR HEART RATE training app (BLE + ANT+). "
+                    "Options override the saved config for this run only.")
+    ap.add_argument("--config", help=f"config file to load/save (default {CONFIG_PATH})")
+    ap.add_argument("--name", help="athlete name")
+    ap.add_argument("--source", choices=["ble", "ant", "sim"])
     ap.add_argument("--address", help="BLE address/UUID of the strap (auto-detect if omitted)")
-    ap.add_argument("--ant-id", type=int, default=0, help="ANT+ device id (0 = any)")
-    ap.add_argument("--minutes", type=float, default=DEFAULT_MINUTES,
+    ap.add_argument("--ant-id", type=int, help="ANT+ device id (0 = any)")
+    ap.add_argument("--minutes", type=float,
                     help="training time / chart display period in minutes (default 50)")
-    ap.add_argument("--age", type=int, default=30)
-    ap.add_argument("--rest-hr", type=int, default=60)
+    ap.add_argument("--age", type=int)
+    ap.add_argument("--rest-hr", type=int)
     ap.add_argument("--max-hr", type=int, help="override estimated max HR")
-    ap.add_argument("--weight", type=float, default=70.0, help="kg")
-    ap.add_argument("--sex", choices=["m", "f"], default="m")
+    ap.add_argument("--weight", type=float, help="kg")
+    ap.add_argument("--sex", choices=["m", "f"])
     ap.add_argument("--alert-hr", type=int, help="alert when HR exceeds this value")
     args = ap.parse_args()
 
