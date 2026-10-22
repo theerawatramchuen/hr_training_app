@@ -4,7 +4,7 @@ A desktop training application for the **TRACKR HEART RATE** chest strap. An adv
 
 The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live heart rate chart coloured by training zone, and records each session with Start, Pause, Resume and Stop controls.
 
-<img width="1320" height="840" alt="image" src="https://github.com/user-attachments/assets/a32e12a0-260f-4618-a1a1-7109d21a8bd0" />
+![TRACKR HEART RATE training app](trackr_app_screenshot.png)
 
 ---
 
@@ -73,6 +73,20 @@ pip install matplotlib numpy
 pip install bleak        # Bluetooth LE
 pip install openant      # ANT+
 ```
+
+### If `pip install bleak` fails
+
+Current bleak (3.x) needs **Python 3.10 or newer**. Check your version with `python --version` (on Windows: `py --list` shows every installed Python).
+
+| Error message contains | Cause | Fix |
+|---|---|---|
+| `Microsoft Visual C++ 14.0 or greater is required`, `Failed building wheel for winrt-…`, or `CMake` errors (Windows) | Your Python is too new for bleak's Windows parts. They have no ready-made package for Python 3.15 yet, so pip tries to compile them | Install **Python 3.13 or 3.14 (64-bit)** from python.org, then use it: `py -3.13 -m pip install bleak matplotlib numpy` and run the app with `py -3.13 trackr_hr.py` |
+| `externally-managed-environment` (Linux, macOS Homebrew) | The system Python does not allow pip installs | Use a virtual environment (see [Installation](#installation)) and install inside it |
+| `Failed building wheel for dbus-fast` or `gcc` / `Python.h` errors (Linux, especially Raspberry Pi with a 32-bit OS) | No ready-made package for your processor, so pip compiles it | `sudo apt install build-essential python3-dev`, then install again; or use a 64-bit OS |
+| `No matching distribution found for bleak` | Python older than 3.10, or a very old pip | Install Python 3.10+; run `python -m pip install --upgrade pip` |
+| Install succeeds but the app says *"Bluetooth needs the bleak package"* | bleak went into a different Python than the one running the app | Install and run with the same interpreter: `python -m pip install bleak` then `python trackr_hr.py` |
+
+Bluetooth is optional: if bleak won't install, the app still runs with **ANT+** or the **Simulator**.
 
 ### Platform notes
 
@@ -332,7 +346,7 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/e39e4ad3-9e99-40d1-90a6-caf881762cea" />
+![Session report example](trackr_session_report_example.png)
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
