@@ -347,8 +347,7 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/0187a12b-8c90-4b7f-bf92-dd5202698413" />
-
+<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/7f4a6c2f-2325-49ec-be96-f1a797819439" />
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
