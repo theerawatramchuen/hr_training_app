@@ -4,7 +4,8 @@ A desktop training application for the **TRACKR HEART RATE** chest strap. An adv
 
 The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live heart rate chart coloured by training zone, and records each session with Start, Pause, Resume and Stop controls.
 
-![TRACKR HEART RATE training app](trackr_app_screenshot.png)
+<img width="1320" height="840" alt="image" src="https://github.com/user-attachments/assets/05fd41e4-0a60-4fea-a6e1-11dc6068fce2" />
+
 
 ---
 
@@ -346,7 +347,8 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-![Session report example](trackr_session_report_example.png)
+<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/0187a12b-8c90-4b7f-bf92-dd5202698413" />
+
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
