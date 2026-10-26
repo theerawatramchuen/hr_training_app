@@ -4,8 +4,7 @@ A desktop training application for the **TRACKR HEART RATE** chest strap. An adv
 
 The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live heart rate chart coloured by training zone, and records each session with Start, Pause, Resume and Stop controls.
 
-<img width="1320" height="840" alt="image" src="https://github.com/user-attachments/assets/05fd41e4-0a60-4fea-a6e1-11dc6068fce2" />
-
+![TRACKR HEART RATE training app](trackr_app_screenshot.png)
 
 ---
 
@@ -20,6 +19,7 @@ The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live
 - [Detection algorithm](#detection-algorithm)
 - [Training metrics and formulas](#training-metrics-and-formulas)
 - [Session files](#session-files)
+- [Session database](#session-database)
 - [Architecture](#architecture)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -39,13 +39,14 @@ The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live
 | **Alerts** | Optional high heart rate alarm and a notification when the target training time is reached |
 | **Auto-reconnect** | The Bluetooth link reconnects automatically if it drops |
 | **Saved config** | **Save Config** stores your name, athlete details, sensor and session settings; they load automatically the next time you open the app |
+| **Session database** | `trackr_db.py` combines all session CSV files into one SQLite database with summaries, every sample, weekly totals and a fitness / fatigue report, as the base for long-term performance tracking |
 | **Session report** | Every session is saved as a CSV of all samples and a PNG report with name, age, sex, weight, date and time, session summary, the HR chart and time-in-zone percentages |
 
 ---
 
 ## Requirements
 
-- **Python 3.9 or newer**
+- **Python 3.10 or newer** (on Windows, 3.13 or 3.14 is recommended; see [If `pip install bleak` fails](#if-pip-install-bleak-fails))
 - **Tkinter**, which ships with Python on Windows and macOS (see below for Linux)
 - **matplotlib** and **numpy**
 - For Bluetooth: **bleak** and a computer with Bluetooth 4.0 or newer
@@ -249,6 +250,7 @@ Closing the window during a session asks whether to save it first.
 - **Zone bands:** shaded backgrounds labelled with zone names and bpm ranges.
 - **Dashed vertical line:** the target training time.
 - **Dotted vertical lines:** places where you paused.
+- **Grey shaded band ("no signal"):** a period of 10 seconds or more when no data arrived from the strap. The line is not drawn across any gap longer than 5 seconds, so a dropout is never shown as a flat line.
 
 **Changing the display period:** edit **Training time (min)** at any time, and the chart rescales immediately. For example, set 30 for a short interval session or 90 for a long ride. If you train past the target, the app beeps, shows a message, and the chart keeps extending. The Remaining card then shows overtime as `+mm:ss` in green.
 
@@ -260,7 +262,7 @@ Closing the window during a session asks whether to save it first.
 | **Zone · % max** | Current zone and heart rate as a percentage of max HR |
 | **Elapsed / Remaining** | Active training time and time left to your target |
 | **Avg HR / Peak HR** | Average and highest heart rate while recording |
-| **HRV (RMSSD)** | Heart rate variability from clean beats only. Higher at rest usually means better recovery; it naturally drops during hard effort |
+| **HRV (RMSSD)** | Heart rate variability from clean beats only. Higher at rest usually means better recovery; it naturally drops during hard effort. Shows `--` for the first seconds while the strap's R-R data is checked, and `n/a` if the strap does not send real beat-to-beat data (see [Detection algorithm](#detection-algorithm)) |
 | **Signal** | Signal quality: green ≥ 70%, amber 40–69%, red < 40%. "No contact" means the strap has lost skin contact |
 | **Training load** | Cumulative Banister TRIMP for the session |
 | **Calories** | Estimated energy burned (kcal) |
@@ -272,7 +274,17 @@ If no data arrives for about 6 seconds, the heart rate shows `--` and the header
 
 ## Detection algorithm
 
-The strap sends both its own heart rate value and the raw time between heartbeats (R-R intervals). Instead of only showing the strap's number, the app processes every R-R interval in five stages:
+The strap sends both its own heart rate value and the raw time between heartbeats (R-R intervals). Instead of only showing the strap's number, the app processes every R-R interval in the stages below.
+
+**Stage 0: R-R data check.** Before trusting the R-R data, the app checks it during the first 15–30 seconds of a session. Until the check is done, heart rate comes from the strap.
+
+- **Units (Bluetooth):** the Bluetooth Heart Rate standard sends R-R in units of 1/1024 second. Some straps send milliseconds instead, which would make the heart rate read about 2.4% (around 3 bpm) too high. The app compares the R-R-derived heart rate with the strap's own value. If they only match when read as milliseconds, the R-R values are corrected automatically, and the status bar says so.
+- **Beat-to-beat check:** real R-R intervals are almost never identical many times in a row. If more than half of consecutive values repeat, the strap is resending a value calculated from its averaged heart rate rather than measuring each beat. The app then uses the strap's heart rate directly, skips stages 1–5, and shows HRV as `n/a`, because HRV from such data would be meaningless.
+- **No R-R data:** straps that send heart rate only are handled the same way.
+
+The result of the check is saved in every CSV row (`rr_status`, `rr_scale`).
+
+Stages 1–5 run when the strap sends real beat-to-beat R-R data:
 
 1. **Physiological gate:** intervals outside 270–2000 ms (about 30–220 bpm) are rejected as impossible.
 2. **Adaptive median gate:** each beat is compared with the median of the last 16 clean beats. Beats more than 20% away are rejected as artifacts (extra or ectopic beats, strap movement, static). During the first few beats, the strap's own heart rate is used as the reference. After three rejections in a row, the tolerance widens and the reference resets, so a real, sudden change such as a sprint start is followed instead of being blocked.
@@ -281,6 +293,8 @@ The strap sends both its own heart rate value and the raw time between heartbeat
 5. **Adaptive smoothing:** a Kalman-style filter smooths the result. It reacts faster when heart rate is changing quickly and smooths harder when the rhythm is steady or the signal is poor.
 
 **Result:** a stable reading that ignores spikes and dropouts but still follows real changes within about 2 seconds. In simulator tests with injected noise spikes and missed beats, the reading started at the correct heart rate, gave realistic HRV values, and followed a jump from 120 to 165 bpm in about 2 seconds.
+
+**Tested with a real session:** a 51-minute session recorded with a TRACKR strap that sends R-R in milliseconds and repeats values was replayed through the app. The millisecond units were detected after 15 seconds and the repeated values after 20 seconds. From then on the heart rate matched the strap exactly (average 129, peak 162 bpm), where the previous version had shown about 3 bpm too high (average 132, peak 166).
 
 ---
 
@@ -347,7 +361,7 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/7f4a6c2f-2325-49ec-be96-f1a797819439" />
+![Session report example](trackr_session_report_example.png)
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
@@ -364,7 +378,7 @@ The report is drawn separately from the window, so it always has the same size a
 
 ### CSV columns
 
-One row per sensor packet (about one per second) while recording; paused time is not recorded.
+One row per sensor packet (one or two per second, depending on the strap) while recording; paused time is not recorded. The last three columns were added in the R-R data check update; older session files do not have them.
 
 | Column | Description |
 |---|---|
@@ -380,6 +394,9 @@ One row per sensor packet (about one per second) while recording; paused time is
 | `rr_accepted_ms` | Accepted R-R intervals in this packet, space-separated (ms) |
 | `rr_rejected` | Number of R-R intervals rejected in this packet |
 | `contact` | Skin contact: `True`, `False`, or empty if not reported |
+| `rr_received_ms` | R-R values as received from the strap in this packet, after unit correction (ms) |
+| `rr_status` | Result of the R-R data check: `checking`, `ok` (real beat-to-beat data), `synthetic` (not beat-to-beat; strap HR used) or `no_rr` |
+| `rr_scale` | Unit correction applied to R-R: `1.0` (standard 1/1024 s) or `1.024` (strap sends milliseconds) |
 
 The CSV opens directly in Excel, Google Sheets, or pandas:
 
@@ -388,6 +405,83 @@ import pandas as pd
 df = pd.read_csv("trackr_sessions/session_20261020_081737.csv")
 print(df[["elapsed_s", "hr_filtered"]].describe())
 ```
+
+---
+
+## Session database
+
+`trackr_db.py` combines the session CSV files into one SQLite database (`trackr.db`), the data layer for tracking training performance over weeks and months. It needs only the Python standard library.
+
+### Commands
+
+```bash
+python trackr_db.py import trackr_sessions/          # import every session_*.csv (folders are searched recursively)
+python trackr_db.py list                             # one line per session
+python trackr_db.py weekly                           # weekly totals per athlete
+python trackr_db.py fitness --days 28                # fitness / fatigue / form by day
+python trackr_db.py athlete "Theerawat Ramchuen" --age 62 --sex m --weight 70 --rest-hr 52
+python trackr_db.py recalc --athlete "Theerawat Ramchuen"
+python trackr_db.py remove 12                        # delete session 12 and its samples
+```
+
+All commands accept `--db PATH` to use another database file, and `list`, `weekly`, `fitness` and `recalc` accept `--athlete NAME`.
+
+| Command | What it does |
+|---|---|
+| `import PATHS…` | Imports CSV files, folders or wildcards. `--athlete NAME` sets the athlete when the file name has none; `--force` re-imports files already in the database; `--no-samples` stores summaries only |
+| `athlete NAME [options]` | Shows or sets an athlete's profile (`--age`, `--sex m/f`, `--weight`, `--rest-hr`, `--max-hr`, `--auto-max` to estimate max HR from age again) |
+| `recalc` | Recalculates zones, TRIMP, calories and HR recovery from the stored samples with the current profiles. Run it after changing a profile, for example when your resting HR improves |
+| `list` / `weekly` / `fitness` | Reports (see below) |
+| `remove IDS…` | Deletes sessions |
+
+### How import works
+
+- **Safe to run again:** each file is identified by its content (SHA-256). Files already imported are skipped, so you can simply run `import trackr_sessions/` after every training session. A changed copy of a session that is already in the database replaces it and keeps its session id.
+- **Athlete:** taken from the file name (`session_20261024_131203_Theerawat_Ramchuen.csv` → "Theerawat Ramchuen"), or `Unknown` if the file name has no name.
+- **Athlete profile:** zones, TRIMP and calories are recalculated for every session from the athlete's profile, using the same formulas as the app, so all sessions are comparable. The profile comes from the `athlete` command or, if not set, from the app's saved config (`~/.trackr_hr/config.json`) when the name matches. Without a profile, the values the app recorded in the CSV are kept (`metrics_source = csv`).
+- **Older session files are corrected:** files recorded before the app's R-R data check (no `rr_status` column) are checked for the same strap problems the app now detects. If the strap sent R-R in milliseconds or not beat-to-beat, the strap's heart rate is used (`corrected = 1`), and HRV values from that file are not stored. For the 24 Oct 2026 session this gives average 129 / peak 162 bpm instead of the 132 / 166 shown at the time.
+- **Bad files:** a CSV that is not a TRACKR session is reported and skipped; the other files are still imported.
+
+### Reports
+
+- **`list`:** date, duration, average and peak HR, TRIMP, calories, % time in each zone, HR recovery, gaps, and whether the session was corrected.
+- **`weekly`:** sessions, minutes, TRIMP, calories, average and peak HR, the share of easy (Z1–2) and hard (Z4–5) time, and average HR recovery. A common guideline is about 80% easy time.
+- **`fitness`:** the Banister fitness-fatigue model on daily TRIMP:
+  - **CTL (fitness):** 42-day average.
+  - **ATL (fatigue):** 7-day average.
+  - **TSB (form):** CTL − ATL. Strongly negative means accumulated fatigue; slightly positive means fresh.
+
+  CTL becomes meaningful after about 6 weeks of data.
+
+### Database schema
+
+| Table / view | Contents |
+|---|---|
+| `athletes` | `id`, `name` (unique, case-insensitive), `age`, `sex`, `weight_kg`, `rest_hr`, `max_hr` (NULL = estimated from age), `updated_at` |
+| `sessions` | One row per session: `athlete_id`, `source_file`, `file_sha256`, `start_time`, `end_time`, `session_date`, `duration_s` (active time), `samples`, `avg_hr`, `max_hr_reached`, `min_hr`, `trimp`, `kcal`, `z1_s`…`z5_s` (seconds per zone), `peak_elapsed_s`, `hrr60_bpm` (HR drop 60 s after the peak, NULL if a gap or the session end prevents measuring), `gaps`, `gap_s`, `avg_confidence`, `hr_source` (`app` or `strap`), `rr_status`, `rr_scale`, `corrected`, the profile used (`profile_rest_hr`, `profile_max_hr`, `profile_age`, `profile_weight`, `profile_sex`), `metrics_source` (`profile` or `csv`), `notes`, `imported_at` |
+| `samples` | Every CSV row: `session_id`, `seq`, `time`, `elapsed_s`, `hr` (the heart rate all metrics use), `hr_filtered`, `hr_device`, `confidence`, `rmssd_ms` (NULL when not valid), `zone`, `rr_accepted_ms`, `rr_rejected`, `contact`, `rr_received_ms`. Deleted together with its session |
+| `v_sessions` | Sessions with athlete name, minutes and zone percentages, ready for display |
+| `v_weekly` | Weekly totals per athlete (`week` as `YYYY-Www`, Monday-based) |
+
+Times are local time in ISO 8601. The schema version is stored in `PRAGMA user_version` (currently 1), so a future tracking app can migrate the database safely.
+
+Example queries for a tracking app:
+
+```sql
+-- HR recovery trend (higher = better fitness)
+SELECT session_date, hrr60_bpm FROM v_sessions
+WHERE athlete = 'Theerawat Ramchuen' AND hrr60_bpm IS NOT NULL ORDER BY session_date;
+
+-- Weekly training volume and easy / hard balance
+SELECT week, minutes, easy_pct, hard_pct FROM v_weekly WHERE athlete = 'Theerawat Ramchuen';
+
+-- Heart rate curve of one session (for a chart)
+SELECT elapsed_s / 60.0 AS minute, hr, zone FROM samples WHERE session_id = 20 ORDER BY seq;
+```
+
+The database can also be opened with tools such as [DB Browser for SQLite](https://sqlitebrowser.org/), or from pandas with `pd.read_sql("SELECT * FROM v_sessions", sqlite3.connect("trackr.db"))`.
+
+**Size:** about 0.5 MB per 50-minute session with samples (at two samples per second), so a year of training stays well under 100 MB. Use `--no-samples` to store summaries only (then `recalc` is not possible for those sessions).
 
 ---
 
@@ -418,7 +512,8 @@ Everything is in a single file, `trackr_hr.py`.
 | `ant_source()` | ANT+ Heart Rate profile with `openant`; derives R-R intervals from beat timing |
 | `sim_source()` | Simulated workout with artifacts, for testing |
 | `SensorWorker` | Runs the selected source in a background thread so the window never freezes |
-| `HeartRateDetector` | The five-stage detection algorithm |
+| `RRValidator` | Stage 0: R-R unit correction and beat-to-beat check |
+| `HeartRateDetector` | The detection algorithm (stages 0–5) |
 | `TrainingAnalytics` | Zones, TRIMP, calories, averages and time in zone |
 | `load_config()` / `write_config()` | Read the saved config at startup and write it (atomically) on Save Config |
 | `TrackrApp` | The Tkinter window, session state machine (ready → recording ⇄ paused → ready), chart, config and file saving |
@@ -438,6 +533,9 @@ Everything is in a single file, `trackr_hr.py`.
 | **Linux: Bluetooth errors** | Check `systemctl status bluetooth`; make sure your user can access BlueZ |
 | **"ANT+ needs openant…"** | Run `pip install openant` and plug in the ANT+ stick |
 | **ANT+ stick not found** | Windows: install the WinUSB driver with Zadig. Linux: add the udev rule from [Installation](#installation). Close Garmin Express or other software using the stick |
+| **HRV shows `n/a`** | The strap does not send real beat-to-beat R-R data (status bar: *"This strap does not send beat-to-beat R-R data"*). Heart rate is still correct; it comes from the strap. HRV needs a strap that sends R-R per beat as the Bluetooth standard describes |
+| **Status bar: "This strap sends R-R intervals in milliseconds…"** | Information only. The strap does not follow the Bluetooth unit standard, and the app has corrected it. No action needed |
+| **Grey "no signal" band in the chart** | No data arrived for 10 seconds or more, usually a short Bluetooth dropout. Keep the computer within a few metres of the strap with a clear line of sight. The session continues automatically when data returns |
 | **ANT+ shows HR but HRV stays `--`** | Some `openant` versions name the beat-timing fields differently, so R-R intervals are not received. Heart rate still works; only HRV and the beat-level algorithm stages are affected |
 | **Signal is amber or red, or "No contact"** | Wet the electrodes, tighten the strap, and position it just below the chest muscles. Dry skin and loose straps are the most common cause of bad readings, especially in the first minutes |
 | **Reading jumps at the start** | Normal for the first few seconds while the algorithm learns your rhythm |
