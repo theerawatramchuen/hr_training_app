@@ -4,8 +4,7 @@ A desktop training application for the **TRACKR HEART RATE** chest strap. An adv
 
 The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live heart rate chart coloured by training zone, and records each session with Start, Pause, Resume and Stop controls.
 
-<img width="1320" height="840" alt="image" src="https://github.com/user-attachments/assets/780ca406-e1a7-4199-a5ba-50d8d7e52326" />
-
+![TRACKR HEART RATE training app](trackr_app_screenshot.png)
 
 ---
 
@@ -38,7 +37,9 @@ The app connects to the strap over **Bluetooth LE** or **ANT+**. It shows a live
 | **Customizable period** | The chart's time axis equals the training time in minutes (**default 50**), and you can change it at any time, even during a session |
 | **Live dashboard** | Heart rate, zone, % of max HR, elapsed and remaining time, average and peak HR, HRV (RMSSD), signal quality, training load (TRIMP), calories and time in zone |
 | **Alerts** | Optional high heart rate alarm and a notification when the target training time is reached |
-| **Auto-reconnect** | The Bluetooth link reconnects automatically if it drops |
+| **Auto-connect** | A saved Bluetooth strap is connected as soon as the app opens, so live heart rate and the sensor battery level show before you press Start. The link reconnects automatically if it drops |
+| **Sensor battery** | The strap's battery level is shown live and checked every minute, with a warning at 15% |
+| **Adjustable layout** | Drag the divider to make the settings panel wider or narrower; the width is saved in the config. Real-time values are shown at 70% of the heart rate size and adapt to the window width |
 | **Saved config** | **Save Config** stores your name, athlete details, sensor and session settings; they load automatically the next time you open the app |
 | **Session database** | `trackr_db.py` combines all session CSV files into one SQLite database with summaries, every sample, weekly totals and a fitness / fatigue report, as the base for long-term performance tracking |
 | **Session report** | Every session is saved as a CSV of all samples and a PNG report with name, age, sex, weight, date and time, session summary, the HR chart and time-in-zone percentages |
@@ -170,10 +171,10 @@ python trackr_hr.py --config ~/athletes/nok.json      # a second athlete with th
 
 | Area | Contents |
 |---|---|
-| **Header** | Connection status (for example `● Connected (BLE)`) and session state badge: `READY`, `● RECORDING` or `❚❚ PAUSED` |
-| **Left panel** | Sensor, athlete and session settings, the Start / Pause / Resume / Stop buttons and **Save Config** |
+| **Header** | Connection status (for example `● Connected (BLE)`) and session state badge: `READY`, or `● RECORDING` / `❚❚ PAUSED` with the elapsed training time |
+| **Left panel** | Sensor, athlete and session settings, the Start / Pause / Resume / Stop buttons and **Save Config**. Drag the divider on its right edge to change its width (260–600 px) |
 | **Heart rate card** | Large live heart rate in the current zone colour, with zone name and % of max HR |
-| **Metric cards** | Elapsed, Remaining, Avg HR, Peak HR, HRV (RMSSD), Signal, Training load, Calories |
+| **Metric cards** | Sensor battery, Remaining, Avg HR, Peak HR, HRV (RMSSD), Signal, Training load, Calories. Values are 70% of the heart rate size; in a narrow window the cards reflow into 3 columns and shrink to fit |
 | **Chart** | Real-time heart rate against training time |
 | **Time in zone** | Coloured bar and per-zone totals |
 | **Status bar** | Connection messages, alerts and save locations |
@@ -186,7 +187,11 @@ python trackr_hr.py --config ~/athletes/nok.json      # a second athlete with th
 | **ANT+** | Plug in the ANT+ stick. Leave **ANT+ ID** at `0` to use the first strap found, or enter the strap's device ID to always use that one (useful in a gym with several straps). |
 | **Simulator** | No hardware needed. Plays a repeating 2-minute workout (warm-up, intervals, cool-down) with injected noise and missed beats, so you can see the algorithm work. |
 
-The connection starts when you press **Start** and ends when you press **Stop**.
+**Automatic connection:** when a Bluetooth strap is chosen (by Scan or from the saved config), the app connects to it right away, also when the app starts, and shows live heart rate, zone and battery level before you press **Start**. It stays connected between sessions, so you can check that the strap reads correctly before training. Choosing another strap or connection type disconnects it and connects the new one.
+
+- If the strap is not on yet, the status bar shows *"Waiting for the heart rate strap…"* and the app keeps trying every few seconds. Put the strap on with moistened electrodes, and the heart rate appears.
+- **ANT+**, the **Simulator**, and Bluetooth without a chosen strap connect when you press **Start** and disconnect at **Stop**, as before.
+- To turn automatic connection off, set `"auto_connect": false` in the config file.
 
 ### 2. Enter athlete settings
 
@@ -203,11 +208,13 @@ Press **Save Config** to store the current settings. The button briefly shows **
 | Name, age, resting HR, max HR, weight, sex | Session data (that goes into the session files) |
 | Connection type, chosen Bluetooth strap, ANT+ ID | |
 | Training time, HR alert | |
+| Settings panel width, automatic connection on/off | |
 
 - Settings are checked before saving; if a value is out of range, an error explains which one.
 - Changes are **not** saved automatically. If you change a setting and close the app without pressing Save Config, the previous saved settings load next time.
 - The config is stored in `~/.trackr_hr/config.json` (on Windows `C:\Users\<you>\.trackr_hr\config.json`). It is plain JSON, so you can also edit or back it up. If the file is damaged, the app starts with default settings and says so in the status bar; pressing Save Config writes a fresh file.
-- A remembered Bluetooth strap is reconnected directly at Start, without scanning.
+- A remembered Bluetooth strap is connected automatically when the app opens, without scanning.
+- **Settings panel width:** drag the divider, then press **Save Config**. The width is stored as `panel_width` (260–600 pixels); you can also type a value in the config file.
 
 Example `config.json`:
 
@@ -224,7 +231,9 @@ Example `config.json`:
   "weight": 64.5,
   "sex": "f",
   "minutes": 50,
-  "alert_hr": 170
+  "alert_hr": 170,
+  "panel_width": 300,
+  "auto_connect": true
 }
 ```
 
@@ -232,10 +241,10 @@ Example `config.json`:
 
 | Button | Available when | What it does |
 |---|---|---|
-| **▶ Start** | Ready | Connects the sensor, clears the previous session and starts recording |
+| **▶ Start** | Ready | Clears the previous session and starts recording (connects the sensor first if it is not connected yet) |
 | **❚❚ Pause** | Recording | Stops the clock, training load and calories. The live heart rate keeps updating and a dotted marker is drawn on the chart |
 | **▶ Resume** | Paused | Continues recording from where you paused |
-| **■ Stop** | Recording or paused | Asks for confirmation, disconnects, saves the session and shows a summary |
+| **■ Stop** | Recording or paused | Asks for confirmation, saves the session and shows a summary. An assigned Bluetooth strap stays connected; other connections are closed |
 
 **Space bar** toggles Pause and Resume (when the cursor is not in a text field).
 
@@ -261,7 +270,8 @@ Closing the window during a session asks whether to save it first.
 |---|---|
 | **Heart rate** | Filtered heart rate from the detection algorithm. It turns red when above your HR alert |
 | **Zone · % max** | Current zone and heart rate as a percentage of max HR |
-| **Elapsed / Remaining** | Active training time and time left to your target |
+| **Sensor battery** | The strap's battery level (Bluetooth Battery Service, read at connection and every 60 s; ANT+ when the strap reports it). Green above 50%, amber 21–50%, red 20% or less, with a status bar warning at 15%. Shows `--` if the strap does not report its battery |
+| **Remaining** | Time left to your target; overtime is shown as `+mm:ss` in green. The elapsed time is shown in the header badge while recording |
 | **Avg HR / Peak HR** | Average and highest heart rate while recording |
 | **HRV (RMSSD)** | Heart rate variability from clean beats only. Higher at rest usually means better recovery; it naturally drops during hard effort. Shows `--` for the first seconds while the strap's R-R data is checked, and `n/a` if the strap does not send real beat-to-beat data (see [Detection algorithm](#detection-algorithm)) |
 | **Signal** | Signal quality: green ≥ 70%, amber 40–69%, red < 40%. "No contact" means the strap has lost skin contact |
@@ -362,8 +372,7 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-<img width="1690" height="1118" alt="image" src="https://github.com/user-attachments/assets/5c4c1217-e4da-4085-8ee8-3cb4fe9efefd" />
-
+![Session report example](trackr_session_report_example.png)
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
@@ -420,6 +429,7 @@ print(df[["elapsed_s", "hr_filtered"]].describe())
 python trackr_db.py import trackr_sessions/          # import every session_*.csv (folders are searched recursively)
 python trackr_db.py list                             # one line per session
 python trackr_db.py weekly                           # weekly totals per athlete
+python trackr_db.py hrr                              # heart rate recovery tests (--valid: valid tests only)
 python trackr_db.py fitness --days 28                # fitness / fatigue / form by day
 python trackr_db.py athlete "Theerawat Ramchuen" --age 62 --sex m --weight 70 --rest-hr 52
 python trackr_db.py recalc --athlete "Theerawat Ramchuen"
@@ -433,7 +443,7 @@ All commands accept `--db PATH` to use another database file, and `list`, `weekl
 | `import PATHS…` | Imports CSV files, folders or wildcards. `--athlete NAME` sets the athlete when the file name has none; `--force` re-imports files already in the database; `--no-samples` stores summaries only |
 | `athlete NAME [options]` | Shows or sets an athlete's profile (`--age`, `--sex m/f`, `--weight`, `--rest-hr`, `--max-hr`, `--auto-max` to estimate max HR from age again) |
 | `recalc` | Recalculates zones, TRIMP, calories and HR recovery from the stored samples with the current profiles. Run it after changing a profile, for example when your resting HR improves |
-| `list` / `weekly` / `fitness` | Reports (see below) |
+| `list` / `weekly` / `hrr` / `fitness` | Reports (see below) |
 | `remove IDS…` | Deletes sessions |
 
 ### How import works
@@ -446,8 +456,24 @@ All commands accept `--db PATH` to use another database file, and `list`, `weekl
 
 ### Reports
 
-- **`list`:** date, duration, average and peak HR, TRIMP, calories, % time in each zone, HR recovery, gaps, and whether the session was corrected.
-- **`weekly`:** sessions, minutes, TRIMP, calories, average and peak HR, the share of easy (Z1–2) and hard (Z4–5) time, and average HR recovery. A common guideline is about 80% easy time.
+- **`list`:** date, duration, average and peak HR, TRIMP, calories, % time in each zone, HR recovery (valid tests only), gaps, and whether the session was corrected.
+- **`weekly`:** sessions, minutes, TRIMP, calories, average and peak HR, and the share of easy (Z1–2) and hard (Z4–5) time (a common guideline is about 80% easy). It also shows the number of valid HR recovery tests (`HRR tests`), their average peak HR (`HRR peak`) and their average `HRR60`.
+- **`hrr`:** every session's heart rate recovery: the peak HR, the HR 60 seconds later, the drop, whether it is a valid test, and if not, why. `--valid` lists only the valid tests, which is the trend to follow.
+### Heart rate recovery (HRR60)
+
+HRR60 is how many beats per minute your heart rate drops in the first minute after a hard effort. A faster drop generally means better fitness. As a rough guide from exercise-test research (with a slow walk as cool-down): under 12 bpm is low, 12–20 normal, 20–30 good, over 30 very good.
+
+The drop depends heavily on how hard the effort was and what you did afterwards, so a session only counts as a **valid recovery test** when all of these hold:
+
+1. **Hard peak:** the peak reaches Zone 4 (80% of heart rate reserve).
+2. **Sustained effort:** the 2 minutes before the peak average Zone 3 or higher, so it was a real effort and not a spike.
+3. **Real cool-down:** HR falls at least 5 bpm in the first 30 seconds and keeps falling to 60 seconds. If the second minute was recorded, HR is still falling then too, so easing back to a steady tempo does not count.
+4. **No signal gap** between the peak and 60 seconds later.
+
+Every hard effort in a session is checked, and the highest valid one is used, so a final effort with a cool-down counts even if your highest HR came earlier. When HR holds flat at the top of an effort, the drop is measured from the end of that plateau (within 2 bpm of the peak), where recovery starts. Sessions that are not valid tests still store their HRR60, with the reason in `hrr_note`, but are left out of the weekly HRR60.
+
+**To record a valid test:** finish a session with 2–3 minutes of hard effort (Zone 4+), then walk slowly or stand for 1–2 minutes while still recording, with the strap snug. Do it the same way at least once a week. Compare HRR60 between tests with a similar peak HR: at the same peak, a rising HRR60 over weeks is a real sign of better recovery.
+
 - **`fitness`:** the Banister fitness-fatigue model on daily TRIMP:
   - **CTL (fitness):** 42-day average.
   - **ATL (fatigue):** 7-day average.
@@ -460,19 +486,19 @@ All commands accept `--db PATH` to use another database file, and `list`, `weekl
 | Table / view | Contents |
 |---|---|
 | `athletes` | `id`, `name` (unique, case-insensitive), `age`, `sex`, `weight_kg`, `rest_hr`, `max_hr` (NULL = estimated from age), `updated_at` |
-| `sessions` | One row per session: `athlete_id`, `source_file`, `file_sha256`, `start_time`, `end_time`, `session_date`, `duration_s` (active time), `samples`, `avg_hr`, `max_hr_reached`, `min_hr`, `trimp`, `kcal`, `z1_s`…`z5_s` (seconds per zone), `peak_elapsed_s`, `hrr60_bpm` (HR drop 60 s after the peak, NULL if a gap or the session end prevents measuring), `gaps`, `gap_s`, `avg_confidence`, `hr_source` (`app` or `strap`), `rr_status`, `rr_scale`, `corrected`, the profile used (`profile_rest_hr`, `profile_max_hr`, `profile_age`, `profile_weight`, `profile_sex`), `metrics_source` (`profile` or `csv`), `notes`, `imported_at` |
+| `sessions` | One row per session: `athlete_id`, `source_file`, `file_sha256`, `start_time`, `end_time`, `session_date`, `duration_s` (active time), `samples`, `avg_hr`, `max_hr_reached`, `min_hr`, `trimp`, `kcal`, `z1_s`…`z5_s` (seconds per zone), `peak_elapsed_s` (time of the peak used for HRR60), `hrr60_bpm` (HR drop 60 s after that peak, NULL if a gap or the session end prevents measuring), `hrr_peak_hr` (that peak HR), `hrr_valid` (1 = valid recovery test, 0 = not, NULL = no athlete profile), `hrr_note` (why it is not a valid test), `gaps`, `gap_s`, `avg_confidence`, `hr_source` (`app` or `strap`), `rr_status`, `rr_scale`, `corrected`, the profile used (`profile_rest_hr`, `profile_max_hr`, `profile_age`, `profile_weight`, `profile_sex`), `metrics_source` (`profile` or `csv`), `notes`, `imported_at` |
 | `samples` | Every CSV row: `session_id`, `seq`, `time`, `elapsed_s`, `hr` (the heart rate all metrics use), `hr_filtered`, `hr_device`, `confidence`, `rmssd_ms` (NULL when not valid), `zone`, `rr_accepted_ms`, `rr_rejected`, `contact`, `rr_received_ms`. Deleted together with its session |
 | `v_sessions` | Sessions with athlete name, minutes and zone percentages, ready for display |
-| `v_weekly` | Weekly totals per athlete (`week` as `YYYY-Www`, Monday-based) |
+| `v_weekly` | Weekly totals per athlete (`week` as `YYYY-Www`, numbered from the first Monday of the year, so one lower than the ISO week number in most calendars). `avg_hrr60`, `avg_hrr_peak` and `hrr_tests` use valid recovery tests only |
 
-Times are local time in ISO 8601. The schema version is stored in `PRAGMA user_version` (currently 1), so a future tracking app can migrate the database safely.
+Times are local time in ISO 8601. The schema version is stored in `PRAGMA user_version` (currently 2), so a future tracking app can migrate the database safely. A database created with an earlier version is upgraded automatically the first time the new `trackr_db.py` opens it, and HRR60 is re-checked for every stored session. Nothing needs to be re-imported.
 
 Example queries for a tracking app:
 
 ```sql
 -- HR recovery trend (higher = better fitness)
-SELECT session_date, hrr60_bpm FROM v_sessions
-WHERE athlete = 'Theerawat Ramchuen' AND hrr60_bpm IS NOT NULL ORDER BY session_date;
+SELECT session_date, hrr_peak_hr, hrr60_bpm FROM v_sessions
+WHERE athlete = 'Theerawat Ramchuen' AND hrr_valid = 1 ORDER BY session_date;
 
 -- Weekly training volume and easy / hard balance
 SELECT week, minutes, easy_pct, hard_pct FROM v_weekly WHERE athlete = 'Theerawat Ramchuen';
@@ -529,6 +555,9 @@ Everything is in a single file, `trackr_hr.py`.
 
 | Problem | What to try |
 |---|---|
+| **"Waiting for the heart rate strap…" at startup** | The saved strap is not awake or is out of range. Put it on with moistened electrodes; the app connects by itself. To stop the app from connecting at startup, set `"auto_connect": false` in the config |
+| **Sensor battery shows `--`** | The strap does not provide the standard Bluetooth Battery Service (or, on ANT+, has not sent a battery page yet). Heart rate is not affected |
+| **Settings panel width is not kept** | Press **Save Config** after dragging the divider |
 | **Scan finds no strap** | Moisten the electrodes and wear the strap; it sleeps when not on skin. Make sure Bluetooth is on, and close other apps connected to the strap (phone apps, watches), since most straps accept only one Bluetooth connection at a time |
 | **"Bluetooth needs the bleak package"** | Run `pip install bleak` in the same Python environment you run the app from |
 | **macOS: scan does nothing** | Allow Bluetooth access for your terminal or IDE in System Settings → Privacy & Security → Bluetooth |
