@@ -372,7 +372,7 @@ The file name is the session start time followed by the athlete's name (spaces b
 
 ### Session report (PNG)
 
-![Session report example](trackr_session_report_example.png)
+<img width="1322" height="872" alt="image" src="https://github.com/user-attachments/assets/ae6e2be8-8aeb-410f-a8d6-9b7dd32c5691" />
 
 The report image is made for sharing with a coach or keeping as a training record. It contains:
 
