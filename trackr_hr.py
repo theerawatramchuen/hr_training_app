@@ -13,6 +13,9 @@ Desktop training application for the TRACKR HEART RATE chest strap.
 * Start / Pause / Resume / Stop session controls
 * Live HR, zone, elapsed / remaining time, HRV (RMSSD), signal quality,
   average / peak HR, training load (TRIMP), calories, time in zone
+* Connects automatically at startup to a saved Bluetooth strap and shows live
+  heart rate and sensor battery level before a session starts
+* Resizable settings panel (width saved in the config file)
 * Every session is saved as CSV + a session report PNG (athlete details,
   date/time, summary, HR chart, time-in-zone %) in ./trackr_sessions
 * Save Config button: settings are stored and loaded automatically at startup
@@ -54,6 +57,7 @@ from datetime import datetime
 from typing import AsyncIterator, Callable, Deque, List, Optional
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
 import numpy as np
@@ -72,6 +76,7 @@ from matplotlib.figure import Figure  # noqa: E402
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+BATTERY_POLL_S = 60          # read the sensor battery level once a minute
 
 Log = Callable[[str], None]
 
@@ -88,6 +93,7 @@ class RawSample:
     contact: Optional[bool] = None                    # skin contact, if reported
     energy_kj: Optional[int] = None
     source: str = ""
+    battery: Optional[int] = None                     # sensor battery %, if known
 
 
 # ==========================================================================
@@ -126,9 +132,97 @@ def parse_ble_hr_measurement(data: bytes) -> RawSample:
 # ==========================================================================
 # Advanced detection algorithm
 # ==========================================================================
+class RRValidator:
+    """
+    Stage 0 - check the strap's R-R data before trusting it.
+
+    * Units: the Bluetooth standard sends R-R in 1/1024 s. Some straps send
+      milliseconds instead, which makes every beat look 2.4% shorter (HR about
+      3 bpm too high). The R-R-derived HR is compared with the strap's own HR;
+      if it matches only when read as milliseconds, R-R is rescaled (BLE only).
+    * Beat-to-beat check: real R-R values are almost never identical many times
+      in a row. If most consecutive values repeat, the strap is resending a
+      value derived from its averaged HR rather than measuring each beat. Then
+      the strap's HR is used directly and HRV is not shown.
+
+    status: "checking" (not enough data yet), "ok", "synthetic" (not
+    beat-to-beat) or "no_rr" (strap sends no R-R data).
+    """
+    CAL_PACKETS = 30          # packets with R-R + strap HR needed to decide
+    UNIT_TOL = 0.008          # 0.8 % tolerance around the 1.000 / 1.024 ratios
+    REPEAT_ON, REPEAT_OFF = 0.50, 0.30   # hysteresis for the repeat test
+
+    def __init__(self):
+        self.check_units = True
+        self.scale = 1.0
+        self.units_decided = False
+        self.status = "checking"
+        self.pairs: Deque[tuple[float, int]] = deque(maxlen=120)  # (median R-R, strap HR)
+        self.recent: Deque[float] = deque(maxlen=60)
+        self.hr_packets = 0
+        self.packets = 0
+        self.messages: List[str] = []
+
+    def _decide_units(self) -> None:
+        ratios = sorted((60000.0 / rr) / hr for rr, hr in self.pairs)
+        med = ratios[len(ratios) // 2]
+        if abs(med - 1.024) < self.UNIT_TOL:
+            self.scale, self.units_decided = 1.024, True
+            self.messages.append("This strap sends R-R intervals in milliseconds instead of the "
+                                 "Bluetooth standard 1/1024 s. Corrected automatically.")
+        elif abs(med - 1.0) < self.UNIT_TOL:
+            self.scale, self.units_decided = 1.0, True
+
+    def _decide_repeats(self) -> None:
+        vals = list(self.recent)
+        rep = sum(a == b for a, b in zip(vals, vals[1:])) / max(1, len(vals) - 1)
+        if self.status != "synthetic" and rep > self.REPEAT_ON:
+            self.status = "synthetic"
+            self.messages.append("This strap does not send beat-to-beat R-R data. Heart rate comes "
+                                 "directly from the strap; HRV is not available.")
+        elif self.status in ("checking", "synthetic") and rep < self.REPEAT_OFF:
+            if self.status == "synthetic":
+                self.messages.append("Beat-to-beat R-R data detected again; HRV re-enabled.")
+            self.status = "ok"
+
+    def feed(self, rr_list: List[float], device_hr: int) -> List[float]:
+        """Return the R-R list in correct milliseconds."""
+        self.packets += 1
+        if device_hr > 0:
+            self.hr_packets += 1
+        for rr in rr_list:
+            self.recent.append(rr)
+        if rr_list and device_hr > 0:
+            self.pairs.append((statistics.median(rr_list), device_hr))
+        if self.packets % 5 == 0:
+            if self.check_units and not self.units_decided and len(self.pairs) >= self.CAL_PACKETS:
+                self._decide_units()
+            if not self.check_units:
+                self.units_decided = True
+            if len(self.recent) >= 40 and (self.units_decided or len(self.pairs) >= 3 * self.CAL_PACKETS):
+                self._decide_repeats()
+            if self.status == "checking" and not self.recent and self.hr_packets >= self.CAL_PACKETS:
+                self.status = "no_rr"
+                self.messages.append("This strap sends no R-R data. Heart rate comes directly from "
+                                     "the strap; HRV is not available.")
+        return [rr * self.scale for rr in rr_list] if self.scale != 1.0 else list(rr_list)
+
+    @property
+    def use_rr(self) -> bool:
+        return self.status == "ok"
+
+    def pop_messages(self) -> List[str]:
+        m, self.messages = self.messages, []
+        return m
+
+
 class HeartRateDetector:
     """
     Multi-stage beat detection and artifact rejection:
+
+    0. R-R validation       - correct non-standard R-R units and detect straps
+       that do not send real beat-to-beat data (see RRValidator). Until the
+       R-R data is confirmed, and for such straps, the strap's own HR is used.
 
     1. Physiological gate   - drop R-R intervals outside 270..2000 ms (30..220 bpm).
     2. Adaptive median gate - drop beats deviating > tolerance from the rolling
@@ -152,6 +246,9 @@ class HeartRateDetector:
         self.consecutive_rejects = 0
         self.x: Optional[float] = None       # Kalman state
         self.p = 25.0
+        self.validator = RRValidator()
+        self._source_set = False
+        self.last_rr: List[float] = []       # R-R as received (after unit correction)
 
     def _filter_rr(self, rr_list: List[float], device_hr: int = 0) -> tuple[List[float], int]:
         accepted, rejected = [], 0
@@ -216,7 +313,13 @@ class HeartRateDetector:
             conf *= 0.8
         return round(min(1.0, max(0.0, conf)), 2)
 
+    @property
+    def rr_status(self) -> str:
+        return self.validator.status
+
     def rmssd(self) -> Optional[float]:
+        if not self.validator.use_rr:
+            return None
         rr = list(self.hrv_hist)
         diffs = [(b - a) ** 2 for a, b in zip(rr, rr[1:]) if a is not None and b is not None]
         if len(diffs) < 10:
@@ -237,7 +340,18 @@ class HeartRateDetector:
         return self.x
 
     def process(self, s: RawSample) -> tuple[float, float, List[float], int]:
-        accepted, rejected = self._filter_rr(s.rr_ms, s.device_hr)
+        if not self._source_set:                  # unit check applies to Bluetooth only
+            self.validator.check_units = s.source == "BLE"
+            self._source_set = True
+        rr_ms = self.validator.feed(s.rr_ms, s.device_hr)
+        self.last_rr = rr_ms
+        if not self.validator.use_rr:
+            # strap HR path: already averaged by the strap, so no extra smoothing
+            conf = 0.05 if s.contact is False else 0.95 if s.contact else 0.85
+            if s.device_hr > 0:
+                self.x = float(s.device_hr)
+            return (self.x or 0.0), conf, [], 0
+        accepted, rejected = self._filter_rr(rr_ms, s.device_hr)
         conf = self._confidence(s.contact, bool(s.rr_ms))
         if self.rr_hist:
             rr_hr = 60000.0 / statistics.median(self.rr_hist)
@@ -367,24 +481,41 @@ async def ble_source(address: Optional[str], log: Log) -> AsyncIterator[RawSampl
     def on_notify(_handle, data: bytearray):
         q.put_nowait(parse_ble_hr_measurement(bytes(data)))
 
+    async def read_battery(client) -> Optional[int]:
+        try:
+            b = await client.read_gatt_char(BATTERY_LEVEL_UUID)
+            return int(b[0]) if b and 0 <= b[0] <= 100 else None
+        except Exception:
+            return None                             # strap has no Battery Service
+
+    batt: Optional[int] = None
+    ever_connected = False
     while True:                                    # auto-reconnect loop
         try:
             async with BleakClient(address, timeout=15.0) as client:
-                try:
-                    batt = await client.read_gatt_char(BATTERY_LEVEL_UUID)
-                    log(f"Connected via Bluetooth. Battery {batt[0]}%")
-                except Exception:
-                    log("Connected via Bluetooth.")
+                ever_connected = True
+                batt = await read_battery(client)
+                log("Connected via Bluetooth." + (f" Sensor battery {batt}%." if batt is not None else ""))
                 await client.start_notify(HR_MEASUREMENT_UUID, on_notify)
+                last_batt = time.monotonic()
                 while client.is_connected:
+                    if time.monotonic() - last_batt >= BATTERY_POLL_S:
+                        last_batt = time.monotonic()
+                        batt = await read_battery(client) or batt
                     try:
-                        yield await asyncio.wait_for(q.get(), timeout=5.0)
+                        sample = await asyncio.wait_for(q.get(), timeout=5.0)
                     except asyncio.TimeoutError:
                         continue
+                    sample.battery = batt
+                    yield sample
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log(f"Bluetooth link lost ({exc}). Reconnecting in 3 s...")
+            if ever_connected:
+                log(f"Bluetooth link lost ({exc}). Reconnecting in 3 s...")
+            else:
+                log(f"Waiting for the heart rate strap ({address})... "
+                    "Moisten the electrodes and put the strap on to wake it.")
         await asyncio.sleep(3)
 
 
@@ -424,7 +555,13 @@ async def ant_source(device_id: int, log: Log) -> AsyncIterator[RawSample]:
                 if dn == 1 and dt > 0:
                     rr.append(dt * 1000.0)
             state["t"], state["n"] = bt, bc
-        loop.call_soon_threadsafe(q.put_nowait, RawSample(time.time(), hr, rr, None, None, "ANT+"))
+        for field_name in ("battery_percentage", "battery_level", "battery"):
+            v = getattr(data, field_name, None)
+            if isinstance(v, (int, float)) and 0 <= v <= 100:
+                state["bat"] = int(v)
+                break
+        loop.call_soon_threadsafe(q.put_nowait, RawSample(time.time(), hr, rr, None, None, "ANT+",
+                                                          state.get("bat")))
 
     device.on_found = on_found
     device.on_device_data = on_data
@@ -470,7 +607,8 @@ async def sim_source(log: Log) -> AsyncIterator[RawSample]:
         rr_acc -= 1000
         contact = random.random() > 0.01
         dev_hr = int(target + random.gauss(0, 2)) if contact else 0
-        yield RawSample(time.time(), dev_hr, rr_list, contact, None, "SIM")
+        battery = max(5, 92 - int(el // 600))      # simulated: -1 % per 10 min
+        yield RawSample(time.time(), dev_hr, rr_list, contact, None, "SIM", battery)
         await asyncio.sleep(1.0)
 
 
@@ -529,6 +667,9 @@ FG, MUTED, ACCENT = "#e6edf3", "#8b98a5", "#ff4d5e"
 ZONE_HEX = {1: "#9aa5b1", 2: "#3b82f6", 3: "#22c55e", 4: "#f59e0b", 5: "#ef4444"}
 SOURCES = {"Bluetooth LE": "ble", "ANT+": "ant", "Simulator": "sim"}
 FONT = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+HR_FONT = 52                       # live heart rate number
+CARD_FONT = round(HR_FONT * 0.7)   # other real-time values: 70 % of the heart rate size
+CARD_FONT_MIN = 24                 # below this the cards reflow into fewer columns
 DEFAULT_MINUTES = 50
 
 # Fonts for the chart / report image, with fallbacks so non-Latin names
@@ -546,7 +687,10 @@ DEFAULT_CONFIG = {
     "name": "", "source": "ble", "device": "", "device_address": "", "ant_id": 0,
     "age": 30, "rest_hr": 60, "max_hr": None, "weight": 70.0, "sex": "m",
     "minutes": DEFAULT_MINUTES, "alert_hr": None,
+    "panel_width": 300,        # settings panel width in pixels (drag the divider, then Save Config)
+    "auto_connect": True,      # connect to the saved Bluetooth strap when the app starts
 }
+PANEL_MIN, PANEL_MAX = 260, 600
 
 
 def load_config(path: str) -> tuple[dict, str]:
@@ -566,6 +710,11 @@ def load_config(path: str) -> tuple[dict, str]:
         cfg["source"] = "ble"
     if cfg["sex"] not in ("m", "f"):
         cfg["sex"] = "m"
+    try:
+        cfg["panel_width"] = min(PANEL_MAX, max(PANEL_MIN, int(cfg["panel_width"])))
+    except (TypeError, ValueError):
+        cfg["panel_width"] = DEFAULT_CONFIG["panel_width"]
+    cfg["auto_connect"] = bool(cfg["auto_connect"])
     return cfg, f"Loaded saved config from {path}"
 
 
@@ -598,12 +747,26 @@ def style_hr_axes(ax, a: "TrainingAnalytics", zone_fontsize: float = 8) -> None:
     ax.set_ylabel("Heart rate (bpm)", color=MUTED, fontsize=9)
 
 
+GAP_BREAK_MIN = 5 / 60      # no line is drawn across a data gap longer than 5 s
+GAP_MARK_MIN = 10 / 60      # gaps of 10 s or more are shaded as "no signal"
+
+
 def hr_segments(xs: List[float], ys: List[float], zs: List[int]):
-    """Line segments coloured by the zone of their end point."""
+    """Line segments coloured by the zone of their end point; gaps are left open."""
     if len(xs) < 2:
         return [], []
     pts = np.column_stack([xs, ys])
-    return np.stack([pts[:-1], pts[1:]], axis=1), [ZONE_HEX[z] for z in zs[1:]]
+    keep = np.diff(pts[:, 0]) <= GAP_BREAK_MIN
+    segs = np.stack([pts[:-1], pts[1:]], axis=1)[keep]
+    return segs, [ZONE_HEX[z] for z, k in zip(zs[1:], keep) if k]
+
+
+def draw_gap(ax, x0: float, x1: float) -> None:
+    """Shade a period without heart rate data."""
+    ax.axvspan(x0, x1, color=MUTED, alpha=0.18, lw=0, zorder=0)
+    if x1 - x0 >= 0.25:
+        ax.text((x0 + x1) / 2, 0.03, "no signal", transform=ax.get_xaxis_transform(),
+                color=MUTED, fontsize=7.5, ha="center", va="bottom", rotation=90)
 
 
 def hr_limits(a: "TrainingAnalytics", xs: List[float], ys: List[float], minutes: float):
@@ -634,7 +797,7 @@ class TrackrApp(tk.Tk):
             cfg["device"] = cfg["device_address"] = args.address
         self.title("TRACKR HEART RATE - Training")
         self.geometry("1320x840")
-        self.minsize(1080, 760)
+        self.minsize(1080, 820)
         self.configure(bg=BG)
 
         self.q: queue.Queue = queue.Queue()
@@ -650,6 +813,11 @@ class TrackrApp(tk.Tk):
         self.last_alert = 0.0
         self.chart_dirty = True
         self.scan_map: dict[str, str] = {}
+        self.panel_width = cfg["panel_width"]
+        self.auto_connect = cfg["auto_connect"]
+        self.battery: Optional[int] = None
+        self.battery_warned = False
+        self._ready = False
         if cfg["device"] and cfg["device_address"] and cfg["device"] != cfg["device_address"]:
             self.scan_map[cfg["device"]] = cfg["device_address"]   # remembered strap
 
@@ -660,6 +828,7 @@ class TrackrApp(tk.Tk):
         self.z_pts: List[int] = []
         self.rows: List[list] = []
         self.pause_marks: List[float] = []
+        self.gap_marks: List[tuple[float, float]] = []
 
         # ---- settings variables ----
         def txt(v) -> str:
@@ -693,6 +862,11 @@ class TrackrApp(tk.Tk):
         if self.scan_map:
             self.dev_cb.config(values=list(self.scan_map))
         self._status(cfg_msg)
+        for ev in ("<<ComboboxSelected>>", "<Return>", "<FocusOut>"):
+            self.dev_cb.bind(ev, lambda e: self._refresh_connection())
+        self._ready = True
+        if self._auto_connect_wanted():
+            self.after(300, self._refresh_connection)
 
         self.bind("<space>", self._space_toggle)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -716,6 +890,9 @@ class TrackrApp(tk.Tk):
                foreground=[("disabled", MUTED)])
         st.map("TEntry", foreground=[("disabled", MUTED)], fieldbackground=[("disabled", PANEL)])
         st.map("TSpinbox", foreground=[("disabled", MUTED)], fieldbackground=[("disabled", PANEL)])
+        st.configure("Sash", sashthickness=12, gripcount=0, background=BG, lightcolor=BG,
+                     darkcolor=BG, bordercolor=BG)
+        st.configure("TPanedwindow", background=BG)
         self.option_add("*TCombobox*Listbox.background", PANEL2)
         self.option_add("*TCombobox*Listbox.foreground", FG)
 
@@ -732,7 +909,7 @@ class TrackrApp(tk.Tk):
     # ------------------------------------------------------------------ layout
     def _section(self, parent: tk.Widget, title: str) -> tk.Frame:
         tk.Label(parent, text=title.upper(), bg=PANEL, fg=MUTED,
-                 font=(FONT, 9, "bold")).pack(anchor="w", padx=14, pady=(12, 4))
+                 font=(FONT, 9, "bold")).pack(anchor="w", padx=14, pady=(10, 3))
         f = tk.Frame(parent, bg=PANEL)
         f.pack(fill="x", padx=14)
         f.columnconfigure(1, weight=1)
@@ -744,12 +921,67 @@ class TrackrApp(tk.Tk):
         widget.grid(row=r, column=1, sticky="ew", pady=3)
         return widget
 
-    def _card(self, parent: tk.Widget, title: str, size: int = 18) -> tuple[tk.Frame, tk.Label]:
-        f = tk.Frame(parent, bg=PANEL, padx=12, pady=8)
-        tk.Label(f, text=title.upper(), bg=PANEL, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
-        v = tk.Label(f, text="--", bg=PANEL, fg=FG, font=(FONT, size, "bold"))
-        v.pack(anchor="w")
+    def _card(self, parent: tk.Widget, title: str) -> tuple[tk.Frame, tk.Label]:
+        f = tk.Frame(parent, bg=PANEL, padx=12, pady=6)
+        tk.Label(f, text=title.upper(), bg=PANEL, fg=MUTED, font=(FONT, 8, "bold"),
+                 anchor="w").pack(fill="x")
+        v = tk.Label(f, text="--", bg=PANEL, fg=FG, font=self.card_font, anchor="w")
+        v.pack(fill="x")
         return f, v
+
+    def _layout_cards(self, cols: int) -> None:
+        for i, key in enumerate(self.card_order):
+            frame = self.cards[key].master
+            frame.grid(row=i // cols, column=i % cols, sticky="nsew",
+                       padx=(0 if i % cols == 0 else 6, 0), pady=(0 if i < cols else 6, 0))
+        for c in range(4):
+            self.cards_grid.columnconfigure(c, weight=1 if c < cols else 0,
+                                            uniform="c" if c < cols else "")
+        for r in range(4):
+            self.cards_grid.rowconfigure(r, weight=1 if r < -(-len(self.card_order) // cols) else 0)
+        self.card_cols = cols
+
+    def _fit_cards(self, event=None) -> None:
+        """Card values use 70 % of the heart rate size. If the cards get too narrow they
+        reflow into 3 columns (and shrink as needed) so the chart keeps its height."""
+        width = self.cards_grid.winfo_width()
+        if width < 50:
+            return
+        for cols in (4, 3):
+            avail = (width - (cols - 1) * 6) / cols - 26   # one card's text width in pixels
+            size = CARD_FONT
+            while size > 12 and self._measure(size, "00:00") > avail:
+                size -= 1
+            if size >= CARD_FONT_MIN:
+                break
+        if cols != getattr(self, "card_cols", 4):
+            self._layout_cards(cols)
+        self.card_avail = avail
+        if size != self.card_font.cget("size"):
+            self.card_font.configure(size=size)
+        for key, lbl in self.cards.items():               # re-fit long texts at the new size
+            self._fit_label(lbl)
+
+    def _measure(self, size: int, text: str) -> int:
+        self._probe_font.configure(size=size)
+        return self._probe_font.measure(text)
+
+    def _fit_label(self, lbl: tk.Label) -> None:
+        text = lbl.cget("text")
+        base = self.card_font.cget("size")
+        if self._measure(base, text) <= getattr(self, "card_avail", 10 ** 6):
+            lbl.config(font=self.card_font)
+            return
+        size = base
+        while size > 9 and self._measure(size, text) > self.card_avail:
+            size -= 1
+        lbl.config(font=(FONT, size, "bold"))
+
+    def _set_card(self, key: str, text: str, fg: str = FG) -> None:
+        lbl = self.cards[key]
+        if lbl.cget("text") != text or lbl.cget("fg") != fg:
+            lbl.config(text=text, fg=fg)
+            self._fit_label(lbl)
 
     def _build(self) -> None:
         # header
@@ -764,13 +996,18 @@ class TrackrApp(tk.Tk):
         self.conn_lbl = tk.Label(hdr, text="● Not connected", bg=BG, fg=MUTED, font=(FONT, 10))
         self.conn_lbl.pack(side="right", padx=12)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=16)
+        # status bar (packed first so it always keeps its place at the bottom)
+        self.status_lbl = tk.Label(self, text="Choose a connection and press Start.", bg=PANEL2,
+                                   fg=MUTED, anchor="w", padx=12, pady=5, font=(FONT, 9))
+        self.status_lbl.pack(fill="x", side="bottom")
+
+        # settings panel | main area, with a draggable divider
+        self.paned = ttk.PanedWindow(self, orient="horizontal")
+        self.paned.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         # ---------------- left panel: settings + controls
-        left = tk.Frame(body, bg=PANEL, width=300)
-        left.pack(side="left", fill="y", pady=(0, 8))
-        left.pack_propagate(False)
+        left = tk.Frame(self.paned, bg=PANEL, width=self.panel_width)
+        self.paned.add(left, weight=0)
 
         self.lockable: List[tk.Widget] = []
 
@@ -805,7 +1042,7 @@ class TrackrApp(tk.Tk):
         self._row(f, 1, "HR alert (bpm)", ttk.Entry(f, textvariable=self.v_alert, width=8))
 
         ctl = tk.Frame(left, bg=PANEL)
-        ctl.pack(fill="x", padx=14, pady=(18, 6))
+        ctl.pack(fill="x", padx=14, pady=(12, 4))
         ctl.columnconfigure((0, 1), weight=1, uniform="b")
         self.btn_start = ttk.Button(ctl, text="▶  Start", style="Start.TButton", command=self.start)
         self.btn_pause = ttk.Button(ctl, text="❚❚  Pause", style="Pause.TButton", command=self.pause)
@@ -820,24 +1057,28 @@ class TrackrApp(tk.Tk):
 
         self.btn_config = ttk.Button(left, text="Save Config", style="Config.TButton",
                                      command=self.save_config)
-        self.btn_config.pack(fill="x", padx=14, pady=(14, 2))
+        self.btn_config.pack(fill="x", padx=14, pady=(10, 2))
         tk.Label(left, text="Saved settings load automatically at startup", bg=PANEL, fg=MUTED,
                  font=(FONT, 8)).pack(anchor="w", padx=14)
 
         # ---------------- right panel: metrics + chart
-        right = tk.Frame(body, bg=BG)
-        right.pack(side="left", fill="both", expand=True, padx=(12, 0))
+        right = tk.Frame(self.paned, bg=BG)
+        self.paned.add(right, weight=1)
+        self.paned.bind("<B1-Motion>", self._on_sash_drag, add="+")
+        self.paned.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
+        self._sash_applied = False
+        self.paned.bind("<Configure>", self._apply_panel_width, add="+")
 
         top = tk.Frame(right, bg=BG)
         top.pack(fill="x")
 
-        hrcard = tk.Frame(top, bg=PANEL, padx=18, pady=8, width=280, height=172)
+        hrcard = tk.Frame(top, bg=PANEL, padx=18, pady=8, width=280, height=180)
         hrcard.pack(side="left", fill="y")
         hrcard.pack_propagate(False)
         tk.Label(hrcard, text="HEART RATE", bg=PANEL, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
         hrline = tk.Frame(hrcard, bg=PANEL)
         hrline.pack(anchor="w")
-        self.hr_lbl = tk.Label(hrline, text="--", bg=PANEL, fg=FG, font=(FONT, 52, "bold"))
+        self.hr_lbl = tk.Label(hrline, text="--", bg=PANEL, fg=FG, font=(FONT, HR_FONT, "bold"))
         self.hr_lbl.pack(side="left")
         tk.Label(hrline, text="bpm", bg=PANEL, fg=MUTED, font=(FONT, 14)).pack(side="left", anchor="s", pady=(0, 16))
         self.zone_lbl = tk.Label(hrcard, text="—", bg=PANEL, fg=MUTED, font=(FONT, 12, "bold"))
@@ -845,17 +1086,18 @@ class TrackrApp(tk.Tk):
 
         grid = tk.Frame(top, bg=BG)
         grid.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.cards_grid = grid
+        self.card_font = tkfont.Font(family=FONT, size=CARD_FONT, weight="bold")
+        self._probe_font = tkfont.Font(family=FONT, size=CARD_FONT, weight="bold")
         self.cards = {}
-        names = [("elapsed", "Elapsed"), ("remaining", "Remaining"), ("avg", "Avg HR"), ("peak", "Peak HR"),
-                 ("hrv", "HRV (RMSSD)"), ("signal", "Signal"), ("trimp", "Training load"), ("kcal", "Calories")]
-        for i, (key, title) in enumerate(names):
-            card, val = self._card(grid, title)
-            card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=(0 if i % 4 == 0 else 6, 0),
-                      pady=(0 if i < 4 else 6, 0))
-            self.cards[key] = val
-        for c in range(4):
-            grid.columnconfigure(c, weight=1, uniform="c")
-        grid.rowconfigure((0, 1), weight=1)
+        names = [("battery", "Sensor battery"), ("remaining", "Remaining"), ("avg", "Avg HR"),
+                 ("peak", "Peak HR"), ("hrv", "HRV (RMSSD)"), ("signal", "Signal"),
+                 ("trimp", "Training load"), ("kcal", "Calories")]
+        for key, title in names:
+            self.cards[key] = self._card(grid, title)[1]
+        self.card_order = [k for k, _ in names]
+        self._layout_cards(4)
+        grid.bind("<Configure>", self._fit_cards)
 
         chart_frame = tk.Frame(right, bg=PANEL)
         chart_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -866,16 +1108,38 @@ class TrackrApp(tk.Tk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
 
         zf = tk.Frame(right, bg=PANEL, padx=12, pady=8)
-        zf.pack(fill="x", pady=(8, 8))
+        zf.pack(side="bottom", fill="x", pady=(8, 8), before=chart_frame)   # keep its height; chart flexes
         tk.Label(zf, text="TIME IN ZONE", bg=PANEL, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
         self.zone_canvas = tk.Canvas(zf, bg=PANEL, height=38, highlightthickness=0)
         self.zone_canvas.pack(fill="x", pady=(4, 0))
         self.zone_canvas.bind("<Configure>", lambda e: self._draw_zone_bar())
 
-        # status bar
-        self.status_lbl = tk.Label(self, text="Choose a connection and press Start.", bg=PANEL2,
-                                   fg=MUTED, anchor="w", padx=12, pady=5, font=(FONT, 9))
-        self.status_lbl.pack(fill="x", side="bottom")
+    # ------------------------------------------------------------------ panel width
+    def _apply_panel_width(self, event=None) -> None:
+        """Set the saved panel width once the window has its real size."""
+        if self._sash_applied or self.paned.winfo_width() < self.panel_width + 200:
+            return
+        self._sash_applied = True
+        self.paned.sashpos(0, self.panel_width)
+
+    def _on_sash_drag(self, event=None) -> None:
+        try:
+            pos = self.paned.sashpos(0)
+        except tk.TclError:
+            return
+        clamped = min(PANEL_MAX, max(PANEL_MIN, pos))
+        if clamped != pos:
+            self.paned.sashpos(0, clamped)
+
+    def _on_sash_release(self, event=None) -> None:
+        self._on_sash_drag()
+        try:
+            pos = self.paned.sashpos(0)
+        except tk.TclError:
+            return
+        if pos != self.panel_width:
+            self.panel_width = pos
+            self._status(f"Settings panel width {pos} px. Press Save Config to keep it.")
 
     # ------------------------------------------------------------------ settings
     def _int(self, var: tk.StringVar, default: Optional[int], lo: int, hi: int) -> Optional[int]:
@@ -931,6 +1195,42 @@ class TrackrApp(tk.Tk):
         self.dev_cb.config(state="normal" if src == "ble" else "disabled")
         self.scan_btn.config(state="normal" if src == "ble" else "disabled")
         self.ant_entry.config(state="normal" if src == "ant" else "disabled")
+        if self._ready:
+            self._refresh_connection()
+
+    def _ble_address(self) -> Optional[str]:
+        dev = self.v_device.get().strip()
+        return self.scan_map.get(dev, dev) or None
+
+    def _auto_connect_wanted(self) -> bool:
+        """A Bluetooth strap is assigned: keep it connected even between sessions."""
+        return (self.auto_connect and SOURCES.get(self.v_source.get()) == "ble"
+                and self._ble_address() is not None)
+
+    def _connect_sensor(self, ant_id: int = 0) -> None:
+        if self.worker is not None:
+            return
+        src = SOURCES[self.v_source.get()]
+        address = self._ble_address() if src == "ble" else None
+        self.detector = HeartRateDetector()          # new connection: check R-R data again
+        self.worker = SensorWorker(src, address, ant_id, self.q)
+        self.worker.start()
+        self._status(f"Connecting to {self.v_device.get().strip()}..." if src == "ble" and address
+                     else "Connecting to sensor...")
+
+    def _refresh_connection(self) -> None:
+        """While idle: (re)connect to the assigned Bluetooth strap, or disconnect if none."""
+        if self.state != "idle" or not self._ready:
+            return
+        w = self.worker
+        if w is not None:
+            same = (w.source == SOURCES.get(self.v_source.get()) and
+                    (w.source != "ble" or w.address == self._ble_address()))
+            if same and (self._auto_connect_wanted() or w.source != "ble"):
+                return
+            self._disconnect()
+        if self._auto_connect_wanted():
+            self._connect_sensor()
 
     def _on_minutes_changed(self) -> None:
         self.target_notified = self._elapsed() >= self._minutes() * 60
@@ -949,6 +1249,8 @@ class TrackrApp(tk.Tk):
         self.target_line = ax.axvline(self._minutes(), color=FG, ls="--", lw=1, alpha=0.5)
         for m in self.pause_marks:
             ax.axvline(m, color=MUTED, ls=":", lw=1)
+        for x0, x1 in self.gap_marks:
+            draw_gap(ax, x0, x1)
         self.chart_dirty = True
         self._redraw_chart(schedule=False)
 
@@ -1019,8 +1321,8 @@ class TrackrApp(tk.Tk):
             messagebox.showerror("Settings", "ANT+ ID must be a number between 0 and 65535.")
             return
 
-        self.detector = HeartRateDetector()
         self.t_min, self.hr_pts, self.z_pts, self.rows, self.pause_marks = [], [], [], [], []
+        self.gap_marks = []
         self.accum, self.run_started = 0.0, time.monotonic()
         self.session_start = datetime.now()
         self.target_notified = False
@@ -1030,14 +1332,10 @@ class TrackrApp(tk.Tk):
         self._lock_settings(True)
         self._set_buttons()
 
-        if self.worker is None:
-            src = SOURCES[self.v_source.get()]
-            dev = self.v_device.get().strip()
-            address = self.scan_map.get(dev, dev) or None
-            self._status("Connecting to sensor...")
-            self.worker = SensorWorker(src, address, ant_id, self.q)
-            self.worker.start()
-        self._status("Training started. Good luck!")
+        connected = self.worker is not None
+        self._connect_sensor(ant_id)
+        self._status("Training started. Good luck!" if connected else
+                     "Training started. Connecting to sensor...")
 
     def pause(self) -> None:
         if self.state != "running":
@@ -1069,7 +1367,8 @@ class TrackrApp(tk.Tk):
             self.accum += time.monotonic() - self.run_started
         self.session_end = datetime.now()
         self.state = "idle"
-        self._disconnect()
+        if not self._auto_connect_wanted():
+            self._disconnect()                       # assigned BLE strap stays connected
         self._lock_settings(False)
         self._set_buttons()
         self.chart_dirty = True
@@ -1119,11 +1418,17 @@ class TrackrApp(tk.Tk):
         hr, conf, acc, rej = self.detector.process(raw)
         zone, zname = self.analytics.zone(hr)
         rmssd = self.detector.rmssd()
+        for msg in self.detector.validator.pop_messages():
+            self._status(msg)
 
         if self.state == "running":
             self.analytics.update(raw.timestamp, hr, zone)
             el = self._elapsed()
             if hr > 0:
+                if self.t_min and el / 60.0 - self.t_min[-1] >= GAP_MARK_MIN:
+                    gap = (self.t_min[-1], el / 60.0)
+                    self.gap_marks.append(gap)
+                    draw_gap(self.ax, *gap)
                 self.t_min.append(el / 60.0)
                 self.hr_pts.append(hr)
                 self.z_pts.append(zone)
@@ -1133,7 +1438,9 @@ class TrackrApp(tk.Tk):
                 f"{el:.1f}", f"{hr:.1f}", raw.device_hr, conf,
                 f"{rmssd:.1f}" if rmssd else "", zone,
                 f"{self.analytics.trimp:.2f}", f"{self.analytics.kcal:.2f}",
-                " ".join(f"{r:.0f}" for r in acc), rej, raw.contact])
+                " ".join(f"{r:.0f}" for r in acc), rej, raw.contact,
+                " ".join(f"{r:.0f}" for r in self.detector.last_rr),
+                self.detector.rr_status, self.detector.validator.scale])
             self._draw_zone_bar()
 
         # live display (also while paused)
@@ -1144,20 +1451,36 @@ class TrackrApp(tk.Tk):
         self.zone_lbl.config(text=f"{zname}  ·  {100 * hr / self.analytics.max_hr:.0f}% max",
                              fg=ZONE_HEX[zone])
         if raw.contact is False:
-            self.cards["signal"].config(text="No contact", fg=ACCENT)
+            self._set_card("signal", "No contact", ACCENT)
         else:
             col = "#22c55e" if conf >= 0.7 else "#f59e0b" if conf >= 0.4 else ACCENT
-            self.cards["signal"].config(text=f"{conf * 100:.0f}%", fg=col)
-        self.cards["hrv"].config(text=f"{rmssd:.0f} ms" if rmssd else "--")
+            self._set_card("signal", f"{conf * 100:.0f}%", col)
+        st = self.detector.rr_status
+        self._set_card("hrv", f"{rmssd:.0f} ms" if rmssd else
+                       "n/a" if st in ("synthetic", "no_rr") else "--",
+                       MUTED if st in ("synthetic", "no_rr") else FG)
         a = self.analytics
-        self.cards["avg"].config(text=f"{a.avg_hr:.0f}" if a.hr_n else "--")
-        self.cards["peak"].config(text=f"{a.peak_hr:.0f}" if a.hr_n else "--")
-        self.cards["trimp"].config(text=f"{a.trimp:.1f}")
-        self.cards["kcal"].config(text=f"{a.kcal:.0f}")
+        self._set_card("avg", f"{a.avg_hr:.0f}" if a.hr_n else "--")
+        self._set_card("peak", f"{a.peak_hr:.0f}" if a.hr_n else "--")
+        self._set_card("trimp", f"{a.trimp:.1f}")
+        self._set_card("kcal", f"{a.kcal:.0f}")
+        if raw.battery is not None:
+            self._set_battery(raw.battery)
         if over and time.monotonic() - self.last_alert > 5:
             self.last_alert = time.monotonic()
             self.bell()
             self._status(f"⚠ Heart rate above your {alert} bpm alert!")
+
+    def _set_battery(self, pct: Optional[int]) -> None:
+        self.battery = pct
+        if pct is None:
+            self._set_card("battery", "--", FG)
+            return
+        col = "#22c55e" if pct > 50 else "#f59e0b" if pct > 20 else ACCENT
+        self._set_card("battery", f"{pct}%", col)
+        if pct <= 15 and not self.battery_warned:
+            self.battery_warned = True
+            self._status(f"⚠ Heart rate strap battery is low ({pct}%). Replace or charge it soon.")
 
     def _alert_hr(self) -> Optional[int]:
         try:
@@ -1168,10 +1491,13 @@ class TrackrApp(tk.Tk):
     def _tick(self) -> None:
         el = self._elapsed()
         total = self._minutes() * 60
-        self.cards["elapsed"].config(text=fmt_time(el))
+        if self.state != "idle":                        # elapsed time shown in the header badge
+            badge = ("● RECORDING" if self.state == "running" else "❚❚ PAUSED") + f"   {fmt_time(el)}"
+            if self.state_lbl.cget("text") != badge:
+                self.state_lbl.config(text=badge)
         rem = total - el
-        self.cards["remaining"].config(text=fmt_time(rem) if rem > 0 else f"+{fmt_time(-rem)}",
-                                       fg=FG if rem > 0 else "#22c55e")
+        self._set_card("remaining", fmt_time(rem) if rem > 0 else f"+{fmt_time(-rem)}",
+                       FG if rem > 0 else "#22c55e")
         if self.state == "running" and rem <= 0 and not self.target_notified:
             self.target_notified = True
             self.bell()
@@ -1189,6 +1515,7 @@ class TrackrApp(tk.Tk):
             self.conn_lbl.config(text="● Not connected", fg=MUTED)
             self.hr_lbl.config(text="--", fg=FG)
             self.zone_lbl.config(text="—", fg=MUTED)
+            self._set_battery(None)
 
     def _status(self, msg: str) -> None:
         self.status_lbl.config(text=msg)
@@ -1228,7 +1555,8 @@ class TrackrApp(tk.Tk):
         with open(base + ".csv", "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["time", "elapsed_s", "hr_filtered", "hr_device", "confidence", "rmssd_ms",
-                        "zone", "trimp", "kcal", "rr_accepted_ms", "rr_rejected", "contact"])
+                        "zone", "trimp", "kcal", "rr_accepted_ms", "rr_rejected", "contact",
+                        "rr_received_ms", "rr_status", "rr_scale"])
             w.writerows(self.rows)
         try:
             self._render_report(base + ".png")
@@ -1314,6 +1642,8 @@ class TrackrApp(tk.Tk):
         ax.axvline(minutes, color=FG, ls="--", lw=1, alpha=0.5)
         for m in self.pause_marks:
             ax.axvline(m, color=MUTED, ls=":", lw=1)
+        for x0, x1 in self.gap_marks:
+            draw_gap(ax, x0, x1)
         xmax, ymin, ymax = hr_limits(a, self.t_min, self.hr_pts, minutes)
         ax.set_xlim(0, xmax)
         ax.set_ylim(ymin, ymax)
@@ -1383,6 +1713,8 @@ class TrackrApp(tk.Tk):
             "sex": "m" if self.v_sex.get() == "Male" else "f",
             "minutes": int(minutes) if minutes == int(minutes) else minutes,
             "alert_hr": alert,
+            "panel_width": self.panel_width,
+            "auto_connect": self.auto_connect,
         }
         try:
             write_config(self.config_path, cfg)
