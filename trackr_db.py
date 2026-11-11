@@ -12,8 +12,10 @@ SQLite database, as the data layer for training performance tracking.
   for the strap's millisecond R-R units / non-beat-to-beat R-R data and
   corrected (heart rate taken from the strap)
 * Summary metrics are calculated the same way for every session, from the
-  athlete's profile: avg / peak HR, time in zones, TRIMP, calories, heart rate
-  recovery (60 s after peak), signal gaps
+  athlete's profile: avg / peak HR, time in zones, TRIMP, calories, signal gaps
+* Heart rate recovery (HRR60) with its peak HR, flagged as a valid recovery test
+  only after a sustained hard effort followed by easing off, so the trend
+  compares like with like
 * Every sample is stored too, so metrics can be recalculated later
   (for example after updating resting or max HR)
 * Ready-made views for weekly totals and a fitness / fatigue (CTL / ATL / TSB)
@@ -29,6 +31,7 @@ Usage
     python trackr_db.py recalc --athlete "Theerawat Ramchuen"  # after changing the profile
     python trackr_db.py list
     python trackr_db.py weekly
+    python trackr_db.py hrr                                   # heart rate recovery tests
     python trackr_db.py fitness --days 28
     python trackr_db.py remove 12                             # delete session id 12
 
@@ -54,7 +57,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Iterable, List, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB = "trackr.db"
 APP_CONFIG = os.path.join(os.path.expanduser("~"), ".trackr_hr", "config.json")
 
@@ -63,6 +66,15 @@ ZONE_THRESHOLDS = (0.6, 0.7, 0.8, 0.9)        # heart-rate-reserve fraction for 
 MAX_DT_S = 5.0                                # longer gaps count as 5 s (as in the app)
 GAP_S = 5.0                                   # a gap longer than this is "no signal"
 UNIT_TOL = 0.008                              # R-R unit check tolerance (0.8 %)
+
+# Heart rate recovery (HRR60) test rules
+HRR_PEAK_FRAC = 0.8          # peak must reach Zone 4 (80 % of heart rate reserve)
+HRR_EFFORT_FRAC = 0.7        # the 2 minutes before the peak must average Zone 3 or more
+HRR_EFFORT_S = 120
+HRR_DROP30_MIN = 5           # HR must fall >= 5 bpm in the first 30 s, and keep falling to 60 s
+HRR_DROP120_MIN = 2          # ... and, if recorded, fall >= 2 bpm more between 60 and 120 s
+HRR_LOCAL_S = 60             # a peak is the highest point within +/- 60 s
+HRR_PLATEAU_BPM = 2          # recovery is measured from the end of the peak plateau
 
 REQUIRED_COLUMNS = {"time", "elapsed_s", "hr_filtered", "hr_device"}
 SAMPLE_COLUMNS = ["time", "elapsed_s", "hr_filtered", "hr_device", "confidence", "rmssd_ms",
@@ -101,8 +113,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     trimp           REAL,
     kcal            REAL,
     z1_s REAL, z2_s REAL, z3_s REAL, z4_s REAL, z5_s REAL,
-    peak_elapsed_s  REAL,
-    hrr60_bpm       REAL,               -- HR drop 60 s after the peak (NULL if not measurable)
+    peak_elapsed_s  REAL,               -- time of the peak used for HRR60
+    hrr60_bpm       REAL,               -- HR drop 60 s after that peak (NULL if not measurable)
+    hrr_peak_hr     REAL,               -- peak HR (10-sample average) the drop is measured from
+    hrr_valid       INTEGER,            -- 1 = valid recovery test, 0 = not, NULL = no profile
+    hrr_note        TEXT,               -- why it is not a valid test
     gaps            INTEGER,            -- number of data gaps > {GAP_S:g} s
     gap_s           REAL,               -- total seconds without data
     avg_confidence  REAL,
@@ -145,7 +160,8 @@ SELECT s.id, a.name AS athlete, s.session_date, s.start_time, s.end_time,
        ROUND(100.0 * s.z3_s / NULLIF(s.z1_s + s.z2_s + s.z3_s + s.z4_s + s.z5_s, 0)) AS z3_pct,
        ROUND(100.0 * s.z4_s / NULLIF(s.z1_s + s.z2_s + s.z3_s + s.z4_s + s.z5_s, 0)) AS z4_pct,
        ROUND(100.0 * s.z5_s / NULLIF(s.z1_s + s.z2_s + s.z3_s + s.z4_s + s.z5_s, 0)) AS z5_pct,
-       s.hrr60_bpm, s.gaps, ROUND(s.gap_s) AS gap_s, s.hr_source, s.corrected, s.metrics_source,
+       s.hrr60_bpm, ROUND(s.hrr_peak_hr) AS hrr_peak_hr, s.hrr_valid, s.hrr_note,
+       s.gaps, ROUND(s.gap_s) AS gap_s, s.hr_source, s.corrected, s.metrics_source,
        s.source_file
 FROM sessions s LEFT JOIN athletes a ON a.id = s.athlete_id;
 
@@ -163,7 +179,10 @@ SELECT a.name AS athlete,
            AS easy_pct,                -- Z1 + Z2 share (aim ~80 %)
        ROUND(100.0 * SUM(s.z4_s + s.z5_s) / NULLIF(SUM(s.z1_s + s.z2_s + s.z3_s + s.z4_s + s.z5_s), 0))
            AS hard_pct,
-       ROUND(AVG(s.hrr60_bpm), 1) AS avg_hrr60
+       -- heart rate recovery: valid recovery tests only
+       ROUND(AVG(CASE WHEN s.hrr_valid = 1 THEN s.hrr60_bpm END), 1) AS avg_hrr60,
+       ROUND(AVG(CASE WHEN s.hrr_valid = 1 THEN s.hrr_peak_hr END)) AS avg_hrr_peak,
+       SUM(CASE WHEN s.hrr_valid = 1 THEN 1 ELSE 0 END) AS hrr_tests
 FROM sessions s LEFT JOIN athletes a ON a.id = s.athlete_id
 GROUP BY a.name, week;
 """
@@ -215,18 +234,9 @@ def compute_metrics(elapsed: List[float], hr: List[float], p: Optional[Profile])
             gap_s += b - a
     m.update(gaps=gaps, gap_s=gap_s)
 
-    # peak (10-sample average to ignore single spikes) and HR recovery 60 s later
-    sm = rolling_mean(hr, 10)
-    m["peak_elapsed_s"] = m["hrr60_bpm"] = None
-    if sm:
-        ip = max(range(len(sm)), key=lambda i: sm[i])
-        m["peak_elapsed_s"] = elapsed[ip]
-        target = elapsed[ip] + 60
-        j = next((k for k in range(ip, len(elapsed)) if elapsed[k] >= target), None)
-        # only measurable if no gap between peak and +60 s and the sample is close to +60 s
-        if j is not None and elapsed[j] - target <= 3 and \
-                all(b - a <= GAP_S for a, b in zip(elapsed[ip:j], elapsed[ip + 1:j + 1])):
-            m["hrr60_bpm"] = round(sm[ip] - sm[j], 1)
+    has_zones = p is not None and p.rest_hr is not None and (p.max_hr or p.age)
+    m.update(compute_hrr(elapsed, hr, p.rest_hr if has_zones else None,
+                         p.effective_max if has_zones else None))
 
     if p and p.complete:
         zt = [0.0] * 5
@@ -248,6 +258,102 @@ def compute_metrics(elapsed: List[float], hr: List[float], p: Optional[Profile])
         m.update(trimp=trimp, kcal=kcal, **{f"z{i + 1}_s": zt[i] for i in range(5)},
                  metrics_source="profile")
     return m
+
+
+def compute_hrr(elapsed: List[float], hr: List[Optional[float]],
+                rest_hr: Optional[float], max_hr: Optional[float]) -> dict:
+    """
+    Heart rate recovery: HR drop in the 60 s after a peak (peaks use a 10-sample average
+    so single spikes are ignored). When HR holds flat at the top of an effort, the drop is
+    measured from the end of that plateau (within 2 bpm of the peak), where recovery starts.
+
+    A peak counts as a valid recovery test when
+      1. it reaches Zone 4 (80 % of heart rate reserve),
+      2. the 2 minutes before it average Zone 3 or more (a sustained hard effort), and
+      3. HR falls at least 5 bpm in the first 30 s and keeps falling to 60 s, and (if the
+         second minute was recorded) still falls between 60 and 120 s - a real cool-down,
+    with no signal gap in between. Every peak in the session is checked, and the highest
+    valid one is used, so a hard final effort with a cool-down counts even when the
+    session's overall maximum came earlier. If none is valid, the session's highest peak
+    is reported with hrr_valid = 0 and the reason in hrr_note.
+    """
+    out = dict(peak_elapsed_s=None, hrr60_bpm=None, hrr_peak_hr=None, hrr_valid=None, hrr_note=None)
+    sm = rolling_mean(hr, 10)
+    n = len(sm)
+    if n < 2 or max(sm) <= 0:
+        return out
+
+    def idx_at(t: float, start: int) -> Optional[int]:
+        k = start
+        while k < n and elapsed[k] < t:
+            k += 1
+        return k if k < n and elapsed[k] - t <= 3 else None
+
+    def no_gap(i: int, j: int) -> bool:
+        return all(elapsed[k + 1] - elapsed[k] <= GAP_S for k in range(i, j))
+
+    def effort_end(ip: int) -> int:
+        """Move from a peak to the end of its plateau (HR within 2 bpm of the peak), where
+        recovery really starts - HR often holds flat during a 2-3 minute hard effort."""
+        k = ip
+        while k + 1 < n and sm[k + 1] >= sm[ip] - HRR_PLATEAU_BPM and \
+                elapsed[k + 1] - elapsed[ip] <= 180 and elapsed[k + 1] - elapsed[k] <= GAP_S:
+            k += 1
+        return k
+
+    def evaluate(ip: int) -> Optional[tuple[float, Optional[int], Optional[str]]]:
+        """(drop, valid, reason) or None if the 60 s after the peak were not recorded."""
+        j60 = idx_at(elapsed[ip] + 60, ip)
+        if j60 is None or not no_gap(ip, j60):
+            return None
+        drop = round(sm[ip] - sm[j60], 1)
+        if rest_hr is None or max_hr is None:
+            return drop, None, "no athlete profile, so the test rules cannot be checked"
+        reserve = max(1.0, max_hr - rest_hr)
+        if sm[ip] < rest_hr + HRR_PEAK_FRAC * reserve:
+            return drop, 0, f"peak {sm[ip]:.0f} bpm is below Zone 4 ({rest_hr + HRR_PEAK_FRAC * reserve:.0f})"
+        i0 = idx_at(elapsed[ip] - HRR_EFFORT_S, 0) if elapsed[ip] >= HRR_EFFORT_S else None
+        effort = [h for h in hr[i0:ip + 1] if h and h > 0] if i0 is not None else []
+        if i0 is None or not no_gap(i0, ip) or not effort or \
+                statistics.mean(effort) < rest_hr + HRR_EFFORT_FRAC * reserve:
+            return drop, 0, "no sustained hard effort (2 min in Zone 3+) before the peak"
+        j30 = idx_at(elapsed[ip] + 30, ip)
+        if j30 is None or sm[ip] - sm[j30] < HRR_DROP30_MIN or sm[j60] >= sm[j30]:
+            return drop, 0, "heart rate did not keep falling after the peak (still exercising)"
+        # if the second minute was recorded, HR must still be falling (not settling at a tempo)
+        j120 = idx_at(elapsed[ip] + 120, j60)
+        if j120 is not None and no_gap(j60, j120) and sm[j120] > sm[j60] - HRR_DROP120_MIN:
+            return drop, 0, "heart rate levelled off after 1 minute (eased to a steady pace, not a cool-down)"
+        return drop, 1, None
+
+    # candidate peaks: highest point within +/- 60 s
+    cands = []
+    lo = hi = 0
+    for i in range(n):
+        while elapsed[lo] < elapsed[i] - HRR_LOCAL_S:
+            lo += 1
+        while hi + 1 < n and elapsed[hi + 1] <= elapsed[i] + HRR_LOCAL_S:
+            hi += 1
+        if sm[i] > 0 and sm[i] >= max(sm[lo:hi + 1]) and (not cands or elapsed[i] - elapsed[cands[-1]] > HRR_LOCAL_S):
+            cands.append(i)
+
+    cands = sorted({effort_end(i) for i in cands})
+    best = None                               # highest valid test
+    for ip in cands:
+        r = evaluate(ip)
+        if r and r[1] == 1 and (best is None or sm[ip] >= sm[best[0]]):
+            best = (ip, r)
+    if best is None:                          # report the overall peak, with the reason
+        ip = effort_end(max(range(n), key=lambda i: sm[i]))
+        r = evaluate(ip)
+        if r is None:
+            r = (None, 0 if rest_hr is not None else None,
+                 "the 60 s after the peak were not recorded (session ended or signal lost)")
+        best = (ip, r)
+    ip, (drop, valid, note) = best
+    out.update(peak_elapsed_s=elapsed[ip], hrr60_bpm=drop, hrr_peak_hr=round(sm[ip], 1),
+               hrr_valid=valid, hrr_note=note)
+    return out
 
 
 def rolling_mean(xs: List[Optional[float]], n: int) -> List[float]:
@@ -319,9 +425,44 @@ def connect(path: str) -> sqlite3.Connection:
     ver = con.execute("PRAGMA user_version").fetchone()[0]
     if ver > SCHEMA_VERSION:
         sys.exit(f"{path} was created by a newer version of trackr_db.py (schema {ver}).")
+    upgrade = ver < 2 and con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").fetchone()
+    if upgrade:                               # schema 1 -> 2: HRR test columns
+        have = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+        for col, typ in (("hrr_peak_hr", "REAL"), ("hrr_valid", "INTEGER"), ("hrr_note", "TEXT")):
+            if col not in have:
+                con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {typ}")
+        con.execute("DROP VIEW IF EXISTS v_sessions")
+        con.execute("DROP VIEW IF EXISTS v_weekly")
     con.executescript(SCHEMA)
+    if upgrade:
+        done = refresh_hrr(con)
+        print(f"Database upgraded to schema {SCHEMA_VERSION}: heart rate recovery re-checked "
+              f"for {done} session(s).")
     con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    con.commit()
     return con
+
+
+def refresh_hrr(con: sqlite3.Connection) -> int:
+    """Re-evaluate HRR60 for all sessions from their stored samples."""
+    done = 0
+    for s in con.execute("SELECT s.id, s.profile_rest_hr, s.profile_max_hr, a.age, a.rest_hr, a.max_hr "
+                         "FROM sessions s LEFT JOIN athletes a ON a.id = s.athlete_id").fetchall():
+        pts = con.execute("SELECT elapsed_s, hr FROM samples WHERE session_id = ? ORDER BY seq",
+                          (s["id"],)).fetchall()
+        if not pts:
+            continue
+        rest, mx = s["profile_rest_hr"], s["profile_max_hr"]
+        if rest is None and s["rest_hr"] is not None and (s["max_hr"] or s["age"]):
+            rest = s["rest_hr"]
+            mx = s["max_hr"] or round(208 - 0.7 * s["age"])
+        h = compute_hrr([r["elapsed_s"] for r in pts], [r["hr"] for r in pts], rest, mx)
+        con.execute("UPDATE sessions SET peak_elapsed_s=?, hrr60_bpm=?, hrr_peak_hr=?, hrr_valid=?, "
+                    "hrr_note=? WHERE id=?", (h["peak_elapsed_s"], h["hrr60_bpm"], h["hrr_peak_hr"],
+                                              h["hrr_valid"], h["hrr_note"], s["id"]))
+        done += 1
+    return done
 
 
 def app_config_profile(name: str, path: str = APP_CONFIG) -> Optional[Profile]:
@@ -445,15 +586,16 @@ def import_file(con: sqlite3.Connection, path: str, athlete_name: Optional[str],
             """INSERT INTO sessions (id, athlete_id, source_file, file_sha256, start_time, end_time,
                session_date, duration_s, samples, hr_source, rr_status, rr_scale, corrected,
                avg_hr, max_hr_reached, min_hr, trimp, kcal, z1_s, z2_s, z3_s, z4_s, z5_s,
-               peak_elapsed_s, hrr60_bpm, gaps, gap_s, avg_confidence, profile_rest_hr,
-               profile_max_hr, profile_age, profile_weight, profile_sex, metrics_source, notes,
-               imported_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               peak_elapsed_s, hrr60_bpm, hrr_peak_hr, hrr_valid, hrr_note, gaps, gap_s,
+               avg_confidence, profile_rest_hr, profile_max_hr, profile_age, profile_weight,
+               profile_sex, metrics_source, notes, imported_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (old["id"] if old else None, ath["id"], name, digest, start.isoformat(timespec="seconds"),
              end.isoformat(timespec="seconds"), start.date().isoformat(), elapsed[-1], len(rows),
              hr_source, rr_status, rr_scale, corrected, m["avg_hr"], m["max_hr_reached"], m["min_hr"],
              m.get("trimp"), m.get("kcal"), *[m.get(f"z{i}_s") for i in range(1, 6)],
-             m["peak_elapsed_s"], m["hrr60_bpm"], m["gaps"], m["gap_s"],
+             m["peak_elapsed_s"], m["hrr60_bpm"], m["hrr_peak_hr"], m["hrr_valid"], m["hrr_note"],
+             m["gaps"], m["gap_s"],
              statistics.mean(conf) if conf else None,
              prof.rest_hr if m["metrics_source"] == "profile" else None,
              prof.effective_max if m["metrics_source"] == "profile" else None,
@@ -481,6 +623,8 @@ def import_file(con: sqlite3.Connection, path: str, athlete_name: Optional[str],
         raise
     flag = " [corrected: HR from strap]" if corrected else ""
     tr = f"TRIMP {m['trimp']:.1f}" if m.get("trimp") is not None else "TRIMP -"
+    if m["hrr_valid"] == 1:
+        tr += f", HRR60 {m['hrr60_bpm']:.0f} from {m['hrr_peak_hr']:.0f}"
     return (f"{'update' if old else 'import'} {name}: session {sid}, {athlete}, "
             f"{elapsed[-1] / 60:.0f} min, avg {m['avg_hr']:.0f} / peak {m['max_hr_reached']:.0f} bpm, "
             f"{tr}{flag}")
@@ -530,9 +674,11 @@ def recalc(con: sqlite3.Connection, athlete: Optional[str]) -> None:
         el, hr = [r["elapsed_s"] for r in pts], [r["hr"] for r in pts]
         m = compute_metrics(el, hr, p)
         con.execute("""UPDATE sessions SET trimp=?, kcal=?, z1_s=?, z2_s=?, z3_s=?, z4_s=?, z5_s=?,
-                       hrr60_bpm=?, profile_rest_hr=?, profile_max_hr=?, profile_age=?, profile_weight=?,
+                       peak_elapsed_s=?, hrr60_bpm=?, hrr_peak_hr=?, hrr_valid=?, hrr_note=?,
+                       profile_rest_hr=?, profile_max_hr=?, profile_age=?, profile_weight=?,
                        profile_sex=?, metrics_source='profile' WHERE id=?""",
-                    (m["trimp"], m["kcal"], *[m[f"z{i}_s"] for i in range(1, 6)], m["hrr60_bpm"],
+                    (m["trimp"], m["kcal"], *[m[f"z{i}_s"] for i in range(1, 6)],
+                     m["peak_elapsed_s"], m["hrr60_bpm"], m["hrr_peak_hr"], m["hrr_valid"], m["hrr_note"],
                      p.rest_hr, p.effective_max, p.age, p.weight_kg, p.sex, s["id"]))
         con.executemany("UPDATE samples SET zone=? WHERE session_id=? AND seq=?",
                         ((zone_of(r["hr"], p) if r["hr"] else None, s["id"], r["seq"]) for r in pts))
@@ -560,14 +706,45 @@ def where_athlete(athlete: Optional[str]) -> tuple[str, tuple]:
     return (" WHERE athlete = ?", (athlete,)) if athlete else ("", ())
 
 
+def hrr_text(r) -> str:
+    """HRR60 for tables: the value for a valid test, '-' otherwise."""
+    return f"{r['hrr60_bpm']:.0f}" if r["hrr_valid"] == 1 and r["hrr60_bpm"] is not None else "-"
+
+
 def cmd_list(con, a) -> None:
     w, args = where_athlete(a.athlete)
-    rows = con.execute(f"SELECT * FROM v_sessions{w} ORDER BY start_time", args).fetchall()
+    rows = [dict(r, hrr=hrr_text(r)) for r in
+            con.execute(f"SELECT * FROM v_sessions{w} ORDER BY start_time", args).fetchall()]
     print_table(rows, [("id", "id"), ("athlete", "athlete"), ("start_time", "start"), ("minutes", "min"),
                        ("avg_hr", "avg"), ("max_hr", "max"), ("trimp", "TRIMP"), ("kcal", "kcal"),
                        ("z1_pct", "Z1%"), ("z2_pct", "Z2%"), ("z3_pct", "Z3%"), ("z4_pct", "Z4%"),
-                       ("z5_pct", "Z5%"), ("hrr60_bpm", "HRR60"), ("gaps", "gaps"),
+                       ("z5_pct", "Z5%"), ("hrr", "HRR60"), ("gaps", "gaps"),
                        ("corrected", "corr"), ("metrics_source", "metrics")])
+    print("\nHRR60 is shown only for valid recovery tests; run 'hrr' for details.")
+
+
+def cmd_hrr(con, a) -> None:
+    """Every session's heart rate recovery with its peak and whether it is a valid test."""
+    w, args = where_athlete(a.athlete)
+    rows = []
+    for r in con.execute(f"SELECT * FROM v_sessions{w} ORDER BY start_time", args).fetchall():
+        if a.valid and r["hrr_valid"] != 1:
+            continue
+        rows.append(dict(r, test={1: "yes", 0: "no"}.get(r["hrr_valid"], "?"),
+                         peak="" if r["hrr_peak_hr"] is None else f"{r['hrr_peak_hr']:.0f}",
+                         drop="" if r["hrr60_bpm"] is None else f"{r['hrr60_bpm']:.0f}",
+                         after="" if r["hrr60_bpm"] is None or r["hrr_peak_hr"] is None
+                         else f"{r['hrr_peak_hr'] - r['hrr60_bpm']:.0f}",
+                         why=r["hrr_note"] or ""))
+    print_table(rows, [("id", "id"), ("athlete", "athlete"), ("start_time", "start"), ("test", "test"),
+                       ("peak", "peak HR"), ("after", "HR +60s"), ("drop", "HRR60"), ("why", "note")])
+    valid = [r for r in rows if r["test"] == "yes"]
+    if valid:
+        print(f"\n{len(valid)} valid recovery test(s). Compare HRR60 between tests with a similar peak HR: "
+              "at the same peak, a larger drop means better recovery.")
+    else:
+        print("\nNo valid recovery tests yet. To make one: finish with 2-3 minutes of hard effort "
+              "(Zone 4+), then walk slowly or stand for at least 1 minute while still recording.")
 
 
 def cmd_weekly(con, a) -> None:
@@ -576,7 +753,8 @@ def cmd_weekly(con, a) -> None:
     print_table(rows, [("athlete", "athlete"), ("week", "week"), ("sessions", "sessions"),
                        ("minutes", "min"), ("trimp", "TRIMP"), ("kcal", "kcal"), ("avg_hr", "avg HR"),
                        ("max_hr", "max HR"), ("easy_pct", "Z1-2 %"), ("hard_pct", "Z4-5 %"),
-                       ("avg_hrr60", "HRR60")])
+                       ("hrr_tests", "HRR tests"), ("avg_hrr_peak", "HRR peak"), ("avg_hrr60", "HRR60")])
+    print("\nHRR60 = average of valid recovery tests only (HRR peak = their average peak HR).")
 
 
 def fitness_series(con, athlete_id: int, until: date) -> List[dict]:
@@ -665,6 +843,9 @@ def main() -> None:
     for name, hlp in (("list", "list sessions"), ("weekly", "weekly totals")):
         p = sub.add_parser(name, help=hlp)
         p.add_argument("--athlete")
+    p = sub.add_parser("hrr", help="heart rate recovery (HRR60) per session, with the test check")
+    p.add_argument("--athlete")
+    p.add_argument("--valid", action="store_true", help="show valid recovery tests only")
     p = sub.add_parser("fitness", help="fitness / fatigue / form (CTL / ATL / TSB) by day")
     p.add_argument("--athlete")
     p.add_argument("--days", type=int, default=14)
@@ -698,6 +879,8 @@ def main() -> None:
             cmd_list(con, a)
         elif a.cmd == "weekly":
             cmd_weekly(con, a)
+        elif a.cmd == "hrr":
+            cmd_hrr(con, a)
         elif a.cmd == "fitness":
             cmd_fitness(con, a)
         elif a.cmd == "remove":
